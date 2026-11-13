@@ -1,10 +1,10 @@
 # Preparing a Windows release
 
-VelvetFrost is a Windows-only fork of [Snowhush](https://github.com/mbezruchko/Snowhush). The intended fork repository is `Solverg/VelvetFrost`, currently private. The fresh local Git repository has no remote configured; verify any future destination and never push to upstream Snowhush. Building locally does not publish anything.
+VelvetFrost is a Windows-only fork of [Snowhush](https://github.com/mbezruchko/Snowhush). The fork repository is `Solverg/VelvetFrost`; verify the destination before every push and never push to upstream Snowhush. Building locally does not publish anything.
 
 ## Before the first release
 
-- Set up the intended fork repository and verify the destination of every push and release. The new local repository starts with no imported history or upstream tags. Review the files and attribution before the first commit and publication.
+- Verify the destination of every push and release. The new repository has no imported history or upstream tags. Review the files and attribution before publication.
 - Choose the release version, repository description and release notes. `windows/Cargo.toml` is the Windows version source, and its lockfile must match. The temporary migration installer was distributed as 0.17.0; use a later version for the next build.
 - Review [LICENSE](LICENSE) and [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), including the exact upstream `Required Notice`. The installer embeds and displays the license and notices offline and installs them beside the application. Verify each release artifact and installation, including silent installation, before publishing. Supply all notices alongside any separately distributed app binary or source snapshot.
 - Review the locked dependency graph and refresh `THIRD-PARTY-NOTICES.txt` when it changes. The Rust standard-library notice snapshot in `notices/RUST-STANDARD-LIBRARY-NOTICES.html` comes from Rust 1.99.0 (b940084d7 2026-09-28); review and replace it with `share/doc/rust/COPYRIGHT-library.html` from the actual release compiler when changing toolchains. Release builds check that the files match; install the Rust documentation component if needed. Review its component licenses and verify the installed and displayed notices offline.
