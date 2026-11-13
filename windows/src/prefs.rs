@@ -59,7 +59,18 @@ impl Settings {
         // Before the slider, the intensity was one of Off, Light, Steady, Heavy and Variable.
         let stop = read(w!("snowfall")).map(|i| i.min(4) as usize);
         let welcomed = read(w!("welcomed")).is_some_and(|v| v != 0);
-        let installed_at = read(w!("installedAt")).unwrap_or_else(|| {
+        let saved_installed_at = read(w!("installedAt"));
+        let first_run = !welcomed && saved_installed_at.is_none();
+        let plow_interval = plow_interval(read(w!("plowInterval")), first_run);
+        let truck_enabled = enabled_from_legacy_interval(read(w!("truckEnabled")), read(w!("truckInterval")), first_run);
+        let sleigh_enabled = enabled_from_legacy_interval(read(w!("sleighEnabled")), read(w!("sleighInterval")), first_run);
+        if first_run {
+            // Persist defaults before the first-run stamp, so a restart before the welcome screen keeps them.
+            write(w!("plowInterval"), plow_interval);
+            write(w!("truckEnabled"), truck_enabled as u32);
+            write(w!("sleighEnabled"), sleigh_enabled as u32);
+        }
+        let installed_at = saved_installed_at.unwrap_or_else(|| {
             let stamp = if welcomed { 0 } else { now() };
             write(w!("installedAt"), stamp);
             stamp
@@ -87,10 +98,9 @@ impl Settings {
             // Before rain there was only a switch for leaves.
             max_performance: read(w!("performance")).is_some_and(|v| v == 1),
             opacity: read(w!("fallingOpacity")).map_or(100, |v| v.clamp(10, 100)),
-            plow_interval: read(w!("plowInterval")).filter(|v| [0, 1, 3, 5, 10].contains(v)).unwrap_or(0),
-            truck_enabled: enabled_from_legacy_interval(read(w!("truckEnabled")), read(w!("truckInterval"))),
-            // Preserve the on/off choice made with the old interval menu.
-            sleigh_enabled: enabled_from_legacy_interval(read(w!("sleighEnabled")), read(w!("sleighInterval"))),
+            plow_interval,
+            truck_enabled,
+            sleigh_enabled,
             mode,
             mixed: read(w!("mixed")).is_some_and(|v| v != 0),
             mix: mix_of(read(w!("mix0")), read(w!("mix1")), mode),
@@ -159,13 +169,23 @@ pub fn valid_tree_front(snow_behind: bool, trees_in_front: bool) -> bool {
     trees_in_front && !snow_behind
 }
 
-fn enabled_from_legacy_interval(saved: Option<u32>, legacy_interval: Option<u32>) -> bool {
-    saved.or_else(|| legacy_interval.filter(|v| [0, 1, 3, 5, 10].contains(v))).is_some_and(|v| v != 0)
+fn plow_interval(saved: Option<u32>, first_run: bool) -> u32 {
+    saved.filter(|v| [0, 1, 3, 5, 10].contains(v)).unwrap_or(if first_run { 10 } else { 0 })
+}
+
+fn enabled_from_legacy_interval(saved: Option<u32>, legacy_interval: Option<u32>, first_run: bool) -> bool {
+    saved.or_else(|| legacy_interval.filter(|v| [0, 1, 3, 5, 10].contains(v))).map_or(first_run, |v| v != 0)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{enabled_from_legacy_interval, valid_tree_front};
+    use super::{Settings, enabled_from_legacy_interval, plow_interval, read, valid_tree_front, write};
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_OPTION_NON_VOLATILE, RegCloseKey, RegCreateKeyExW, RegDeleteKeyValueW, RegDeleteTreeW,
+        RegOpenKeyExW, RegOverridePredefKey,
+    };
+    use windows::core::{PCWSTR, w};
 
     #[test]
     fn trees_cannot_be_in_front_when_snow_is_behind_windows() {
@@ -179,14 +199,95 @@ mod tests {
 
     #[test]
     fn vehicle_setting_migrates_legacy_intervals_and_prefers_the_new_choice() {
-        assert!(!enabled_from_legacy_interval(None, None));
-        assert!(!enabled_from_legacy_interval(None, Some(0)));
+        assert!(enabled_from_legacy_interval(None, None, true));
+        assert!(!enabled_from_legacy_interval(None, None, false));
+        assert!(!enabled_from_legacy_interval(None, Some(0), true));
         for interval in [1, 3, 5, 10] {
-            assert!(enabled_from_legacy_interval(None, Some(interval)));
+            assert!(enabled_from_legacy_interval(None, Some(interval), false));
         }
-        assert!(!enabled_from_legacy_interval(None, Some(2)));
-        assert!(!enabled_from_legacy_interval(Some(0), Some(5)));
-        assert!(enabled_from_legacy_interval(Some(1), Some(0)));
+        assert!(!enabled_from_legacy_interval(None, Some(2), false));
+        assert!(!enabled_from_legacy_interval(Some(0), Some(5), true));
+        assert!(enabled_from_legacy_interval(Some(1), Some(0), false));
+    }
+
+    #[test]
+    fn plow_defaults_to_ten_minutes_only_on_first_run() {
+        assert_eq!(plow_interval(None, true), 10);
+        assert_eq!(plow_interval(None, false), 0);
+        for interval in [0, 1, 3, 5, 10] {
+            assert_eq!(plow_interval(Some(interval), true), interval);
+            assert_eq!(plow_interval(Some(interval), false), interval);
+        }
+        assert_eq!(plow_interval(Some(2), false), 0);
+    }
+
+    #[test]
+    fn first_run_vehicle_defaults_are_persisted_and_existing_choices_survive() {
+        const CHILD: &str = "VELVETFROST_DEFAULTS_TEST_ROOT";
+        if let Ok(root) = std::env::var(CHILD) {
+            let root: Vec<u16> = root.encode_utf16().chain([0]).collect();
+            let mut key = HKEY::default();
+            unsafe {
+                assert_eq!(RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(root.as_ptr()), None, KEY_ALL_ACCESS, &mut key), ERROR_SUCCESS);
+                assert_eq!(RegOverridePredefKey(HKEY_CURRENT_USER, Some(key)), ERROR_SUCCESS);
+            }
+            let first = Settings::load();
+            assert_eq!((first.plow_interval, first.truck_enabled, first.sleigh_enabled), (10, true, true));
+            assert_eq!(read(w!("plowInterval")), Some(10));
+            assert_eq!(read(w!("truckEnabled")), Some(1));
+            assert_eq!(read(w!("sleighEnabled")), Some(1));
+            let restarted = Settings::load();
+            assert_eq!((restarted.plow_interval, restarted.truck_enabled, restarted.sleigh_enabled), (10, true, true));
+
+            write(w!("plowInterval"), 0);
+            write(w!("truckEnabled"), 0);
+            write(w!("sleighEnabled"), 0);
+            let disabled = Settings::load();
+            assert_eq!((disabled.plow_interval, disabled.truck_enabled, disabled.sleigh_enabled), (0, false, false));
+
+            for name in [w!("plowInterval"), w!("truckEnabled"), w!("sleighEnabled")] {
+                assert_eq!(unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, super::KEY, name) }, ERROR_SUCCESS);
+            }
+            write(w!("truckInterval"), 5);
+            write(w!("sleighInterval"), 0);
+            let legacy = Settings::load();
+            assert_eq!((legacy.plow_interval, legacy.truck_enabled, legacy.sleigh_enabled), (0, true, false));
+            return;
+        }
+
+        let id = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let root = format!("Software\\VelvetFrostDefaultsTest-{id}");
+        let root_wide: Vec<u16> = root.encode_utf16().chain([0]).collect();
+        let mut key = HKEY::default();
+        unsafe {
+            assert_eq!(
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(root_wide.as_ptr()),
+                    None,
+                    PCWSTR::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_ALL_ACCESS,
+                    None,
+                    &mut key,
+                    None,
+                ),
+                ERROR_SUCCESS
+            );
+            let _ = RegCloseKey(key);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["prefs::tests::first_run_vehicle_defaults_are_persisted_and_existing_choices_survive", "--exact", "--nocapture"])
+            .env(CHILD, &root)
+            .output()
+            .unwrap();
+        assert_eq!(unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(root_wide.as_ptr())) }, ERROR_SUCCESS);
+        assert!(
+            output.status.success(),
+            "isolated defaults test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
