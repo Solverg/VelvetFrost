@@ -1,0 +1,2 @@
+# Preserve the toolchain's notice bytes for the release-build integrity check.
+notices/RUST-STANDARD-LIBRARY-NOTICES.html -text

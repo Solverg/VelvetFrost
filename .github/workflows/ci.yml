@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    name: Simulation tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Formatting
+        run: |
+          cargo fmt --check --manifest-path core/Cargo.toml
+          cargo fmt --check --manifest-path windows/Cargo.toml
+      - name: Tests
+        run: cargo test --locked --manifest-path core/Cargo.toml
+
+  windows:
+    name: Windows app
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Keep the release-build notice snapshot aligned with the CI compiler.
+      - run: rustup toolchain install 1.99.0 --profile minimal --component rust-docs
+      - name: Check Windows Cargo configuration
+        working-directory: windows
+        shell: pwsh
+        run: |
+          $cfg = cargo +1.99.0 rustc --locked --lib -- --print cfg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($cfg -notcontains 'target_feature="crt-static"') { throw 'Windows static CRT configuration was not applied' }
+      - run: cargo +1.99.0 build --locked --release --bin VelvetFrost
+        working-directory: windows
+      - run: cargo +1.99.0 test --locked
+        working-directory: windows

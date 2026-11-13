@@ -1,0 +1,333 @@
+//! VelvetFrost-Setup.exe: the app with a one-card installer in its own style.
+//! `--silent` (or `/S`) installs without showing anything, for package managers.
+
+#![windows_subsystem = "windows"]
+
+use std::cell::RefCell;
+use std::path::PathBuf;
+
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::{PCWSTR, Result, w};
+
+use snowhush::card::{self, Card, Content, Hits};
+use snowhush::{install, license};
+use snowhush_core::text::{self, tr};
+
+/// The app this installer carries, built before it.
+const APP: &[u8] = include_bytes!(env!("SNOWHUSH_APP"));
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const CLASS: PCWSTR = w!("SnowhushSetup");
+const WIDTH: f32 = 400.0;
+const HEIGHT: f32 = 380.0;
+
+enum Stage {
+    Ready,
+    Installing,
+    Done(PathBuf),
+    Failed(String),
+}
+
+struct Setup {
+    window: HWND,
+    card: Card,
+    hits: Hits,
+    stage: Stage,
+    installed: Option<String>,
+    pressed: bool,
+    holding: bool,
+    holding_link: bool,
+}
+
+thread_local! {
+    static SETUP: RefCell<Option<Setup>> = const { RefCell::new(None) };
+}
+
+fn main() {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    snowhush::language::choose();
+    if std::env::args().skip(1).any(|argument| argument.eq_ignore_ascii_case("--license")) {
+        if license::show(None).is_ok() {
+            message_loop();
+        }
+        return;
+    }
+    if std::env::args().skip(1).any(|argument| argument.eq_ignore_ascii_case("--silent") || argument.eq_ignore_ascii_case("/s")) {
+        std::process::exit(if install::install(APP, VERSION).is_ok() { 0 } else { 1 });
+    }
+    if open().is_err() {
+        return;
+    }
+    message_loop();
+}
+
+fn message_loop() {
+    unsafe {
+        let mut message = MSG::default();
+        while GetMessageW(&mut message, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
+fn open() -> Result<()> {
+    card::register(CLASS, Some(procedure))?;
+    let installed = install::installed_version();
+    let (scale, _) = card::placement(WIDTH, HEIGHT);
+    let stages = [Stage::Ready, Stage::Done(PathBuf::new())];
+    let words: Vec<_> = stages.iter().map(|stage| words(stage, installed.as_deref())).collect();
+    let contents: Vec<_> = words.iter().map(|words| content(words, false)).collect();
+    let height = Card::new(WIDTH, HEIGHT, scale)?.fitting_height(&contents, HEIGHT)?;
+    let (scale, origin) = card::placement(WIDTH, height);
+    let card = Card::new(WIDTH, height, scale)?;
+    let (pixels, hits) = paint(&card, &Stage::Ready, installed.as_deref(), false)?;
+    unsafe {
+        let window = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_APPWINDOW,
+            CLASS,
+            w!("VelvetFrost Setup"),
+            WS_POPUP | WS_SYSMENU | WS_MINIMIZEBOX,
+            origin.x,
+            origin.y,
+            card.size.0,
+            card.size.1,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        card::present(window, card.size, &pixels, Some(origin));
+        SETUP.set(Some(Setup { window, card, hits, stage: Stage::Ready, installed, pressed: false, holding: false, holding_link: false }));
+        let _ = ShowWindow(window, SW_SHOW);
+        let _ = SetForegroundWindow(window);
+    }
+    Ok(())
+}
+
+/// The card for a stage of the installation.
+fn paint(card: &Card, stage: &Stage, installed: Option<&str>, pressed: bool) -> Result<(Vec<u8>, Hits)> {
+    let installing = matches!(stage, Stage::Installing);
+    card.paint(&content(&words(stage, installed), pressed || installing))
+}
+
+/// A stage's title, text and button.
+struct Words {
+    title: String,
+    body: String,
+    button: String,
+    closable: bool,
+}
+
+fn words(stage: &Stage, installed: Option<&str>) -> Words {
+    let version = [("version", VERSION)];
+    let (title, body, button) = match stage {
+        Stage::Ready | Stage::Installing => {
+            let (body, button) = match installed {
+                None => (text::fill("setup.fresh", &version), "setup.install"),
+                Some(old) if snowhush_core::version::newer(VERSION, old) => {
+                    (text::fill("setup.newer", &[("old", old), ("version", VERSION)]), "setup.update")
+                }
+                Some(old) => (text::fill("setup.same", &[("old", old), ("version", VERSION)]), "setup.reinstall"),
+            };
+            ("VelvetFrost", body, if matches!(stage, Stage::Installing) { "setup.installing" } else { button })
+        }
+        Stage::Done(_) => (tr("setup.settle"), tr("setup.done").to_string(), "setup.open"),
+        Stage::Failed(error) => ("VelvetFrost", text::fill("setup.failed", &[("error", error)]), "setup.retry"),
+    };
+    let title = if title == "VelvetFrost" { title.to_string() } else { title.to_uppercase() };
+    let button = if button == "setup.open" { tr(button).to_string() } else { tr(button).to_uppercase() };
+    Words { title, body, button, closable: !matches!(stage, Stage::Installing) }
+}
+
+fn content(words: &Words, pressed: bool) -> Content<'_> {
+    Content {
+        icon: 96.0,
+        title: &words.title,
+        title_size: 40.0,
+        body: &words.body,
+        button: &words.button,
+        pressed,
+        closable: words.closable,
+        link: words.closable.then(|| tr("setup.license")),
+    }
+}
+
+unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match message {
+        WM_NCHITTEST => {
+            let mut origin = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(window, &mut origin);
+            }
+            let point = card::point(lparam);
+            let inside = SETUP.with_borrow(|setup| {
+                setup.as_ref().map(|setup| {
+                    let at = setup.card.dips(POINT { x: point.x - origin.left, y: point.y - origin.top });
+                    card::contains(&setup.hits.button, at)
+                        || setup.hits.close.is_some_and(|close| card::contains(&close, at))
+                        || setup.hits.link.is_some_and(|link| card::contains(&link, at))
+                })
+            });
+            // The card drags the window anywhere but on its controls.
+            LRESULT(if inside == Some(false) { HTCAPTION as isize } else { HTCLIENT as isize })
+        }
+        WM_LBUTTONDOWN | WM_MOUSEMOVE | WM_LBUTTONUP => {
+            unsafe {
+                if message == WM_LBUTTONDOWN {
+                    SetCapture(window);
+                } else if message == WM_LBUTTONUP {
+                    let _ = ReleaseCapture();
+                }
+            }
+            let at = card::point(lparam);
+            let outcome = SETUP.with_borrow_mut(|setup| setup.as_mut().map(|setup| setup.press(message, at)));
+            if let Some((action, repaint)) = outcome {
+                if let Some(pixels) = repaint {
+                    show(&pixels);
+                }
+                match action {
+                    Some(Action::Button) => act(),
+                    Some(Action::Close) => close(),
+                    Some(Action::License) => show_license(window),
+                    None => {}
+                }
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN if wparam.0 == VK_RETURN.0 as usize => {
+            act();
+            LRESULT(0)
+        }
+        WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
+            close();
+            LRESULT(0)
+        }
+        WM_SYSKEYDOWN if wparam.0 == b'L' as usize => {
+            show_license(window);
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            close();
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+    }
+}
+
+enum Action {
+    Button,
+    Close,
+    License,
+}
+
+impl Setup {
+    /// Tracks a press on the button or the close mark: what was clicked, and the card redrawn if the button's look changed.
+    fn press(&mut self, message: u32, point: POINT) -> (Option<Action>, Option<Vec<u8>>) {
+        let at = self.card.dips(point);
+        let on_button = card::contains(&self.hits.button, at);
+        let on_close = self.hits.close.is_some_and(|close| card::contains(&close, at));
+        let on_link = self.hits.link.is_some_and(|link| card::contains(&link, at));
+        let mut action = None;
+        match message {
+            WM_LBUTTONDOWN => {
+                self.holding = on_button;
+                self.holding_link = on_link;
+            }
+            WM_LBUTTONUP => {
+                if self.holding && on_button {
+                    action = Some(Action::Button);
+                } else if self.holding_link && on_link {
+                    action = Some(Action::License);
+                } else if on_close {
+                    action = Some(Action::Close);
+                }
+                self.holding = false;
+                self.holding_link = false;
+            }
+            _ if !self.holding => return (None, None),
+            _ => {}
+        }
+        let pressed = self.holding && on_button;
+        if pressed == self.pressed {
+            return (action, None);
+        }
+        self.pressed = pressed;
+        (action, self.repaint())
+    }
+
+    fn repaint(&mut self) -> Option<Vec<u8>> {
+        let (pixels, hits) = paint(&self.card, &self.stage, self.installed.as_deref(), self.pressed).ok()?;
+        self.hits = hits;
+        Some(pixels)
+    }
+}
+
+fn show_license(window: HWND) {
+    if license::show(Some(window)).is_err() {
+        let text = windows::core::HSTRING::from(license::TEXT);
+        unsafe {
+            MessageBoxW(Some(window), &text, w!("VelvetFrost"), MB_OK);
+        }
+    }
+}
+
+fn show(pixels: &[u8]) {
+    if let Some((window, size)) = SETUP.with_borrow(|setup| setup.as_ref().map(|setup| (setup.window, setup.card.size))) {
+        card::present(window, size, pixels, None);
+    }
+}
+
+/// Moves the card to a new stage and shows it.
+fn stage(stage: Stage) {
+    if let Some(pixels) = SETUP.with_borrow_mut(|setup| {
+        let setup = setup.as_mut()?;
+        setup.stage = stage;
+        setup.pressed = false;
+        setup.repaint()
+    }) {
+        show(&pixels);
+    }
+}
+
+/// The button: installs, or once installed opens the app and leaves.
+fn act() {
+    let done = SETUP.with_borrow(|setup| match setup.as_ref().map(|setup| &setup.stage) {
+        Some(Stage::Done(exe)) => Some(Some(exe.clone())),
+        Some(Stage::Installing) | None => None,
+        _ => Some(None),
+    });
+    match done {
+        Some(Some(exe)) => {
+            install::launch(&exe);
+            close();
+        }
+        Some(None) => {
+            stage(Stage::Installing);
+            stage(match install::install(APP, VERSION) {
+                Ok(exe) => Stage::Done(exe),
+                Err(error) => Stage::Failed(error),
+            });
+        }
+        None => {}
+    }
+}
+
+fn close() {
+    if SETUP.with_borrow(|setup| setup.as_ref().is_some_and(|setup| matches!(setup.stage, Stage::Installing))) {
+        return;
+    }
+    if let Some(setup) = SETUP.take() {
+        unsafe {
+            let _ = DestroyWindow(setup.window);
+        }
+    }
+}

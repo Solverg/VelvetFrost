@@ -1,0 +1,34 @@
+.build/
+build/
+dist/
+.DS_Store
+.playwright-mcp/
+windows/target/
+core/target/
+linux/target/
+linux/packaging/pkg/
+linux/packaging/src/
+linux/packaging/*.pkg.tar.zst
+linux/packaging/dist/
+linux/bench/out/
+site-engine/target/
+
+# Local agent state and private working material are not part of the product.
+.agents/
+.codex/
+.claude/
+AGENTS.md
+CLAUDE.md
+/.local/
+
+# Local credentials, settings backups, and build output.
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+*.reg
+*.log
+**/target/

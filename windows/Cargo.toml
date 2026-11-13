@@ -1,0 +1,82 @@
+[package]
+name = "snowhush"
+version = "0.18.0"
+edition = "2024"
+publish = false
+autobins = false
+
+[features]
+# Builds VelvetFrost-Setup.exe, which carries the app built first; see RELEASING.md.
+setup = []
+# Standalone development build; never enabled in the normal release.
+cone-test-20s = []
+# Standalone test build with frequent fox visits; never enabled in normal releases.
+fox-test-20s = []
+# Standalone development build to preview bullfinch visits.
+bullfinch-test-20s = []
+# Standalone development build to preview gift spawning and animation.
+gift-test-20s = []
+# Standalone development build to preview the snowflake event.
+star-test-20s = []
+# Isolated UI preview; it never reads or writes the user's collection.
+inventory-preview = []
+
+[[bin]]
+name = "VelvetFrost"
+path = "src/main.rs"
+
+[[bin]]
+name = "VelvetFrost-Setup"
+path = "src/bin/setup.rs"
+required-features = ["setup"]
+
+[dependencies]
+snowhush-core = { path = "../core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-numerics = "0.3"
+windows-core = "0.62"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Performance",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

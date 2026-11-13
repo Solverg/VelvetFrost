@@ -1,0 +1,1217 @@
+use std::cell::{OnceCell, RefCell};
+use std::collections::HashMap;
+use std::mem::{offset_of, size_of};
+
+use windows::Win32::Foundation::{HMODULE, HWND};
+use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_10_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_11_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+    D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, D3D_SRV_DIMENSION_BUFFER, ID3DBlob,
+};
+use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::DirectComposition::{
+    DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR, DCompositionCreateDevice, IDCompositionDevice, IDCompositionEffectGroup, IDCompositionTarget,
+    IDCompositionVisual,
+};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16G16_FLOAT,
+    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_SAMPLE_DESC,
+};
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter,
+    IDXGIDevice, IDXGIFactory2, IDXGISwapChain1,
+};
+use windows::core::{Error, Interface, PCSTR, Result, s};
+use windows_numerics::Matrix3x2;
+
+use snowhush_core::geometry::V2;
+use snowhush_core::halloween::{PUMPKIN_ASPECT, PUMPKIN_CANDLE};
+use snowhush_core::simulation::{COLUMN_WIDTH, PumpkinSprite, SnowSimulation, Sprite};
+
+use crate::halloween::{self, SIGN_SCALE};
+use crate::log;
+use crate::plow::Plow;
+use crate::sculpt::SculptureDraw;
+use crate::sleigh::Sleigh;
+use crate::truck::Truck;
+
+// The digitized leaves' tables come first: the shaders draw the leaves from them.
+const SHADERS: &str = concat!(include_str!("leaves.hlsl"), "\n", include_str!("shaders.hlsl"));
+/// How far the cursor's candlelight reaches, in points.
+pub const LANTERN_REACH: f32 = 130.0;
+const GIFT_LANTERN_REACH: f32 = 200.0;
+const GIFT_LANTERN_BRIGHTNESS: f32 = 1.1;
+
+// The sprites' input layout reads a ghost's, a leaf's, rain's and a drop's parts at these offsets.
+const _: () = assert!(
+    offset_of!(Sprite, ghost) == 48
+        && offset_of!(Sprite, pose) == 64
+        && offset_of!(Sprite, mood) == 80
+        && offset_of!(Sprite, leaf) == 88
+        && offset_of!(Sprite, spin) == 100
+        && offset_of!(Sprite, rain) == 108
+        && offset_of!(Sprite, drop) == 116
+        && offset_of!(Sprite, petal) == 132
+        && size_of::<Sprite>() == 136
+);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Uniforms {
+    view_size: [f32; 2],
+    scale: f32,
+    time: f32,
+    column_width: f32,
+    column_count: i32,
+    pile_top: f32,
+    occluder_count: i32,
+    origin: [f32; 2],
+    pile_bottom: f32,
+    height_offset: i32,
+    light: [f32; 4],
+    shadow_tint: [f32; 4],
+    rim: [f32; 4],
+    /// The cursor's glow: where it is, how far it reaches and how bright it is.
+    lantern: [f32; 4],
+    /// How far everything is jolted: x and y.
+    shake: [f32; 4],
+    /// The pumpkins' candles: where each burns, how far its light reaches and how bright it is.
+    pumpkins: [[f32; 4]; 3],
+    occluders: [[f32; 4]; 16],
+    /// One while all that heaps up is leaves, for a ghost; a pile has its own leaves and petals in each column.
+    autumn: f32,
+    /// One while the leaves are cherry blossom petals.
+    blossom: f32,
+    /// One while fallen leaves wither away.
+    wilt: f32,
+    padding: f32,
+}
+
+/// Where a sign stands: its stick's foot, its size in points, how far it is turned and the drift's surface it comes up out of.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Placement {
+    anchor: [f32; 2],
+    size: [f32; 2],
+    angle: f32,
+    ground: f32,
+    padding: [f32; 2],
+}
+
+/// Where a pumpkin sits: the middle of its bottom, its size in points, where its candle burns and what sets its
+/// flicker apart from the others'.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PumpkinPlacement {
+    anchor: [f32; 2],
+    size: [f32; 2],
+    candle: [f32; 2],
+    seed: f32,
+    padding: f32,
+}
+
+impl PumpkinPlacement {
+    fn new(pumpkin: &PumpkinSprite) -> PumpkinPlacement {
+        let size = [pumpkin.width, pumpkin.width * PUMPKIN_ASPECT];
+        let candle = [pumpkin.anchor.x + (PUMPKIN_CANDLE[0] - 0.5) * size[0], pumpkin.anchor.y + PUMPKIN_CANDLE[1] * size[1]];
+        PumpkinPlacement { anchor: [pumpkin.anchor.x, pumpkin.anchor.y], size, candle, seed: pumpkin.seed, padding: 0.0 }
+    }
+
+    /// Its candle's light on the snow: where it burns, how far it reaches and how bright it is, brighter at `night`.
+    fn light(&self, night: f32) -> [f32; 4] {
+        [self.candle[0], self.candle[1], self.size[0] * 1.6, 0.4 + 0.6 * night]
+    }
+}
+
+/// The light the snow is drawn in.
+#[derive(Clone, Copy)]
+pub struct Ambient {
+    pub light: [f32; 3],
+    pub shadow_tint: [f32; 4],
+    /// The colour the snow's surface glows, and how much.
+    pub rim: [f32; 4],
+    /// The cursor, in points, glowing like a candle in a jack-o'-lantern, and how brightly.
+    pub lantern: (V2, f32),
+}
+
+/// A sign's picture on the graphics card, and its size in points.
+type Picture = (ID3D11ShaderResourceView, [f32; 2]);
+
+pub struct Gpu {
+    device: ID3D11Device,
+    context: ID3D11DeviceContext,
+    factory: IDXGIFactory2,
+    composition: IDCompositionDevice,
+    sprite_vertex: ID3D11VertexShader,
+    sprite_fragment: ID3D11PixelShader,
+    sculpture_fragment: ID3D11PixelShader,
+    sprite_layout: ID3D11InputLayout,
+    pile_vertex: ID3D11VertexShader,
+    pile_fragment: ID3D11PixelShader,
+    sign_vertex: ID3D11VertexShader,
+    sign_fragment: ID3D11PixelShader,
+    plow_vertex: ID3D11VertexShader,
+    plow_fragment: ID3D11PixelShader,
+    truck_vertex: ID3D11VertexShader,
+    truck_fragment: ID3D11PixelShader,
+    train_fragment: ID3D11PixelShader,
+    sleigh_vertex: ID3D11VertexShader,
+    sleigh_fragment: ID3D11PixelShader,
+    pumpkin_vertex: ID3D11VertexShader,
+    pumpkin_fragment: ID3D11PixelShader,
+    /// Drops on the glass: their bumps added up into a field, and the glass drawn from it.
+    field_fragment: ID3D11PixelShader,
+    glass_vertex: ID3D11VertexShader,
+    glass_fragment: ID3D11PixelShader,
+    adding: ID3D11BlendState,
+    sampler: ID3D11SamplerState,
+    pixel_sampler: ID3D11SamplerState,
+    /// Clear past the picture's edges, for the pumpkins' glow around them.
+    bordered: ID3D11SamplerState,
+    blend: ID3D11BlendState,
+    raster: ID3D11RasterizerState,
+    uniforms: ID3D11Buffer,
+    placement: ID3D11Buffer,
+    pumpkin: ID3D11Buffer,
+    /// Each caption's sign, made the first time a ghost holds it up; none if it couldn't be.
+    signs: RefCell<HashMap<usize, Option<Picture>>>,
+    /// The pumpkin's shell and its face, made the first time one is drawn; none if they couldn't be.
+    pumpkin_pictures: OnceCell<Option<[ID3D11ShaderResourceView; 2]>>,
+    plow_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    truck_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    train_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    sleigh_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    fox_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    bullfinch_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    fox_burrow_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    gift_pictures: [OnceCell<Option<ID3D11ShaderResourceView>>; 2],
+    warm_lantern_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    boombox_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    golden_snowflake_picture: OnceCell<Option<ID3D11ShaderResourceView>>,
+    conifer_pictures: [OnceCell<Option<ID3D11ShaderResourceView>>; 21],
+    pub adapter: String,
+}
+
+impl Gpu {
+    pub fn new() -> Result<Gpu> {
+        unsafe {
+            let mut device = None;
+            let mut context = None;
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                Some(&[D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0]),
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut context),
+            )?;
+            let device: ID3D11Device = device.ok_or_else(Error::empty)?;
+            let context = context.ok_or_else(Error::empty)?;
+            let dxgi: IDXGIDevice = device.cast()?;
+            let adapter: IDXGIAdapter = dxgi.GetAdapter()?;
+            let description = adapter.GetDesc()?;
+            let name_length = description.Description.iter().position(|&c| c == 0).unwrap_or(description.Description.len());
+            let factory: IDXGIFactory2 = adapter.GetParent()?;
+            let composition: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
+
+            let sprite_code = compile(s!("spriteVertex"), s!("vs_4_0"))?;
+            let pile_code = compile(s!("pileVertex"), s!("vs_4_0"))?;
+            let sprite_vertex = vertex_shader(&device, &sprite_code)?;
+            let pile_vertex = vertex_shader(&device, &pile_code)?;
+            let sprite_fragment = pixel_shader(&device, &compile(s!("spriteFragment"), s!("ps_4_0"))?)?;
+            let sculpture_fragment = pixel_shader(&device, &compile(s!("sculptureFragment"), s!("ps_4_0"))?)?;
+            let pile_fragment = pixel_shader(&device, &compile(s!("pileFragment"), s!("ps_4_0"))?)?;
+            let sign_vertex = vertex_shader(&device, &compile(s!("signVertex"), s!("vs_4_0"))?)?;
+            let sign_fragment = pixel_shader(&device, &compile(s!("signFragment"), s!("ps_4_0"))?)?;
+            let plow_vertex = vertex_shader(&device, &compile(s!("plowVertex"), s!("vs_4_0"))?)?;
+            let plow_fragment = pixel_shader(&device, &compile(s!("plowFragment"), s!("ps_4_0"))?)?;
+            let truck_vertex = vertex_shader(&device, &compile(s!("truckVertex"), s!("vs_4_0"))?)?;
+            let truck_fragment = pixel_shader(&device, &compile(s!("truckFragment"), s!("ps_4_0"))?)?;
+            let train_fragment = pixel_shader(&device, &compile(s!("trainFragment"), s!("ps_4_0"))?)?;
+            let sleigh_vertex = vertex_shader(&device, &compile(s!("sleighVertex"), s!("vs_4_0"))?)?;
+            let sleigh_fragment = pixel_shader(&device, &compile(s!("sleighFragment"), s!("ps_4_0"))?)?;
+            let pumpkin_vertex = vertex_shader(&device, &compile(s!("pumpkinVertex"), s!("vs_4_0"))?)?;
+            let pumpkin_fragment = pixel_shader(&device, &compile(s!("pumpkinFragment"), s!("ps_4_0"))?)?;
+            let field_fragment = pixel_shader(&device, &compile(s!("fieldFragment"), s!("ps_4_0"))?)?;
+            let glass_vertex = vertex_shader(&device, &compile(s!("glassVertex"), s!("vs_4_0"))?)?;
+            let glass_fragment = pixel_shader(&device, &compile(s!("glassFragment"), s!("ps_4_0"))?)?;
+
+            let element = |name: PCSTR, format: DXGI_FORMAT, offset: u32| D3D11_INPUT_ELEMENT_DESC {
+                SemanticName: name,
+                SemanticIndex: 0,
+                Format: format,
+                InputSlot: 0,
+                AlignedByteOffset: offset,
+                InputSlotClass: D3D11_INPUT_PER_INSTANCE_DATA,
+                InstanceDataStepRate: 1,
+            };
+            let elements = [
+                element(s!("POSITION"), DXGI_FORMAT_R32G32_FLOAT, 0),
+                element(s!("VELOCITY"), DXGI_FORMAT_R32G32_FLOAT, 8),
+                element(s!("BODY"), DXGI_FORMAT_R32G32B32A32_FLOAT, 16),
+                element(s!("TINTCOLOR"), DXGI_FORMAT_R32G32B32_FLOAT, 32),
+                element(s!("LUMP"), DXGI_FORMAT_R32_FLOAT, 44),
+                element(s!("GHOST"), DXGI_FORMAT_R32G32B32A32_FLOAT, 48),
+                element(s!("POSE"), DXGI_FORMAT_R32G32B32A32_FLOAT, 64),
+                element(s!("MOOD"), DXGI_FORMAT_R32G32_FLOAT, 80),
+                element(s!("LEAF"), DXGI_FORMAT_R32G32B32_FLOAT, 88),
+                element(s!("SPIN"), DXGI_FORMAT_R32G32_FLOAT, 100),
+                element(s!("RAIN"), DXGI_FORMAT_R32G32_FLOAT, 108),
+                element(s!("DROP"), DXGI_FORMAT_R32G32B32A32_FLOAT, 116),
+                element(s!("PETAL"), DXGI_FORMAT_R32_FLOAT, 132),
+            ];
+            let mut sprite_layout = None;
+            device.CreateInputLayout(&elements, blob_bytes(&sprite_code), Some(&mut sprite_layout))?;
+
+            let target = D3D11_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D11_BLEND_ONE,
+                DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D11_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D11_BLEND_ONE,
+                DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOpAlpha: D3D11_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            let blend_desc = D3D11_BLEND_DESC { RenderTarget: [target; 8], ..Default::default() };
+            let mut blend = None;
+            device.CreateBlendState(&blend_desc, Some(&mut blend))?;
+            let adding_target = D3D11_RENDER_TARGET_BLEND_DESC { DestBlend: D3D11_BLEND_ONE, DestBlendAlpha: D3D11_BLEND_ONE, ..target };
+            let mut adding = None;
+            device.CreateBlendState(&D3D11_BLEND_DESC { RenderTarget: [adding_target; 8], ..Default::default() }, Some(&mut adding))?;
+
+            let raster_desc =
+                D3D11_RASTERIZER_DESC { FillMode: D3D11_FILL_SOLID, CullMode: D3D11_CULL_NONE, DepthClipEnable: true.into(), ..Default::default() };
+            let mut raster = None;
+            device.CreateRasterizerState(&raster_desc, Some(&mut raster))?;
+
+            let sampler_desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MaxAnisotropy: 1,
+                ComparisonFunc: D3D11_COMPARISON_NEVER,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            let mut sampler = None;
+            device.CreateSamplerState(&sampler_desc, Some(&mut sampler))?;
+            let mut pixel_sampler = None;
+            device.CreateSamplerState(&D3D11_SAMPLER_DESC { Filter: D3D11_FILTER_MIN_MAG_MIP_POINT, ..sampler_desc }, Some(&mut pixel_sampler))?;
+            let bordered_desc = D3D11_SAMPLER_DESC {
+                AddressU: D3D11_TEXTURE_ADDRESS_BORDER,
+                AddressV: D3D11_TEXTURE_ADDRESS_BORDER,
+                AddressW: D3D11_TEXTURE_ADDRESS_BORDER,
+                BorderColor: [0.0; 4],
+                ..sampler_desc
+            };
+            let mut bordered = None;
+            device.CreateSamplerState(&bordered_desc, Some(&mut bordered))?;
+
+            let uniforms = dynamic_buffer(&device, size_of::<Uniforms>(), D3D11_BIND_CONSTANT_BUFFER)?;
+            let placement = dynamic_buffer(&device, size_of::<Placement>(), D3D11_BIND_CONSTANT_BUFFER)?;
+            let pumpkin = dynamic_buffer(&device, size_of::<PumpkinPlacement>(), D3D11_BIND_CONSTANT_BUFFER)?;
+
+            Ok(Gpu {
+                device,
+                context,
+                factory,
+                composition,
+                sprite_vertex,
+                sprite_fragment,
+                sculpture_fragment,
+                sprite_layout: sprite_layout.ok_or_else(Error::empty)?,
+                pile_vertex,
+                pile_fragment,
+                sign_vertex,
+                sign_fragment,
+                plow_vertex,
+                plow_fragment,
+                truck_vertex,
+                truck_fragment,
+                train_fragment,
+                sleigh_vertex,
+                sleigh_fragment,
+                pumpkin_vertex,
+                pumpkin_fragment,
+                field_fragment,
+                glass_vertex,
+                glass_fragment,
+                adding: adding.ok_or_else(Error::empty)?,
+                sampler: sampler.ok_or_else(Error::empty)?,
+                pixel_sampler: pixel_sampler.ok_or_else(Error::empty)?,
+                bordered: bordered.ok_or_else(Error::empty)?,
+                blend: blend.ok_or_else(Error::empty)?,
+                raster: raster.ok_or_else(Error::empty)?,
+                uniforms,
+                placement,
+                pumpkin,
+                signs: RefCell::new(HashMap::new()),
+                pumpkin_pictures: OnceCell::new(),
+                plow_picture: OnceCell::new(),
+                truck_picture: OnceCell::new(),
+                train_picture: OnceCell::new(),
+                sleigh_picture: OnceCell::new(),
+                fox_picture: OnceCell::new(),
+                bullfinch_picture: OnceCell::new(),
+                fox_burrow_picture: OnceCell::new(),
+                gift_pictures: std::array::from_fn(|_| OnceCell::new()),
+                warm_lantern_picture: OnceCell::new(),
+                boombox_picture: OnceCell::new(),
+                golden_snowflake_picture: OnceCell::new(),
+                conifer_pictures: std::array::from_fn(|_| OnceCell::new()),
+                adapter: String::from_utf16_lossy(&description.Description[..name_length]),
+            })
+        }
+    }
+
+    fn write<T: Copy>(&self, buffer: &ID3D11Buffer, value: &T) -> Result<()> {
+        unsafe {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.context.Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+            mapped.pData.cast::<T>().write(*value);
+            self.context.Unmap(buffer, 0);
+        }
+        Ok(())
+    }
+
+    fn sign(&self, caption: usize) -> Option<Picture> {
+        let mut signs = self.signs.borrow_mut();
+        let picture =
+            signs.entry(caption).or_insert_with(|| self.make_sign(caption).inspect_err(|error| log!("sign {caption} failed: {error}")).ok());
+        picture.clone()
+    }
+
+    fn make_sign(&self, caption: usize) -> Result<Picture> {
+        let picture = halloween::sign_picture(caption)?;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: picture.width,
+            Height: picture.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let data = D3D11_SUBRESOURCE_DATA { pSysMem: picture.pixels.as_ptr().cast(), SysMemPitch: picture.width * 4, SysMemSlicePitch: 0 };
+        let mut texture = None;
+        let mut view = None;
+        unsafe {
+            self.device.CreateTexture2D(&desc, Some(&data), Some(&mut texture))?;
+            self.device.CreateShaderResourceView(&texture.ok_or_else(Error::empty)?, None, Some(&mut view))?;
+        }
+        Ok((view.ok_or_else(Error::empty)?, [picture.width as f32 / SIGN_SCALE, picture.height as f32 / SIGN_SCALE]))
+    }
+
+    fn pumpkin_pictures(&self) -> Option<&[ID3D11ShaderResourceView; 2]> {
+        self.pumpkin_pictures.get_or_init(|| self.make_pumpkin_pictures().inspect_err(|error| log!("pumpkins failed: {error}")).ok()).as_ref()
+    }
+
+    fn plow_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.plow_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../assets/pixel-snowplow.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("snowplow picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn truck_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.truck_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../assets/velvetfrost-christmas-truck.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("truck picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn train_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.train_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../assets/velvetfrost-road-train.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("road train picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn conifer_picture(&self, kind: f32, species: usize, variant: usize) -> Option<&ID3D11ShaderResourceView> {
+        let category = if kind == 6.0 {
+            0
+        } else if kind == 7.0 {
+            1
+        } else if kind == 9.0 {
+            2
+        } else {
+            return None;
+        };
+        let species = species.min(2);
+        let index = if category == 0 && variant == 6 {
+            20
+        } else if category == 0 && variant == 5 {
+            19
+        } else if category == 0 && variant == 4 {
+            18
+        } else if category == 0 && variant > 0 {
+            6 + variant.min(3) * 3 + species
+        } else {
+            category * 3 + species
+        };
+        let bytes: &[u8] = match index {
+            0 => include_bytes!("../assets/pixel-spruce-0.png"),
+            1 => include_bytes!("../assets/pixel-pine-0.png"),
+            2 => include_bytes!("../assets/pixel-fir-0.png"),
+            3 => include_bytes!("../assets/pixel-cone-spruce.png"),
+            4 => include_bytes!("../assets/pixel-cone-pine.png"),
+            5 => include_bytes!("../assets/pixel-cone-fir.png"),
+            6 => include_bytes!("../assets/pixel-young-spruce.png"),
+            7 => include_bytes!("../assets/pixel-young-pine.png"),
+            8 => include_bytes!("../assets/pixel-young-fir.png"),
+            9 => include_bytes!("../assets/pixel-spruce-1.png"),
+            10 => include_bytes!("../assets/pixel-pine-1.png"),
+            11 => include_bytes!("../assets/pixel-fir-1.png"),
+            12 => include_bytes!("../assets/pixel-spruce-2.png"),
+            13 => include_bytes!("../assets/pixel-pine-2.png"),
+            14 => include_bytes!("../assets/pixel-fir-2.png"),
+            15 => include_bytes!("../assets/pixel-spruce-3.png"),
+            16 => include_bytes!("../assets/pixel-pine-3.png"),
+            17 => include_bytes!("../assets/pixel-fir-3.png"),
+            18 => include_bytes!("../assets/pixel-celestial-tree.png"),
+            19 => include_bytes!("../assets/pixel-ruby-tree-v2.png"),
+            _ => include_bytes!("../assets/pixel-rose-tree.png"),
+        };
+        self.conifer_pictures[index]
+            .get_or_init(|| {
+                halloween::decode(bytes).and_then(|image| self.mipmapped(&image)).inspect_err(|error| log!("conifer picture failed: {error}")).ok()
+            })
+            .as_ref()
+    }
+
+    fn golden_snowflake_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.golden_snowflake_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../assets/pixel-golden-snowflake.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("golden snowflake picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn fox_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.fox_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../assets/pixel-arctic-fox-walk.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("fox picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn bullfinch_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.bullfinch_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../assets/pixel-bullfinch.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("bullfinch picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn gift_picture(&self, green: bool) -> Option<&ID3D11ShaderResourceView> {
+        self.gift_pictures[usize::from(green)]
+            .get_or_init(|| {
+                let bytes: &[u8] = if green { include_bytes!("../assets/pixel-gift-green.png") } else { include_bytes!("../assets/pixel-gift.png") };
+                halloween::decode(bytes).and_then(|image| self.mipmapped(&image)).inspect_err(|error| log!("gift picture failed: {error}")).ok()
+            })
+            .as_ref()
+    }
+
+    fn boombox_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.boombox_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../assets/pixel-boombox.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("boombox picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn warm_lantern_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.warm_lantern_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../assets/pixel-warm-lantern.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("warm lantern picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn fox_burrow_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.fox_burrow_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../assets/pixel-arctic-fox-burrow.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("fox burrow picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn sleigh_picture(&self) -> Option<&ID3D11ShaderResourceView> {
+        self.sleigh_picture
+            .get_or_init(|| {
+                halloween::decode(include_bytes!("../../Resources/Concepts/santa-sleigh.png"))
+                    .and_then(|image| self.mipmapped(&image))
+                    .inspect_err(|error| log!("sleigh picture failed: {error}"))
+                    .ok()
+            })
+            .as_ref()
+    }
+
+    fn make_pumpkin_pictures(&self) -> Result<[ID3D11ShaderResourceView; 2]> {
+        let [shell, face] = halloween::pumpkin_pictures()?;
+        Ok([self.mipmapped(&shell)?, self.mipmapped(&face)?])
+    }
+
+    /// A picture with its smaller copies, made on the graphics card: the pumpkins are shown at a fraction of their
+    /// pictures' size, and would shimmer without them.
+    fn mipmapped(&self, picture: &halloween::Picture) -> Result<ID3D11ShaderResourceView> {
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: picture.width,
+            Height: picture.height,
+            MipLevels: 0,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+        };
+        let mut texture = None;
+        let mut view = None;
+        unsafe {
+            self.device.CreateTexture2D(&desc, None, Some(&mut texture))?;
+            let texture = texture.ok_or_else(Error::empty)?;
+            self.device.CreateShaderResourceView(&texture, None, Some(&mut view))?;
+            let view = view.ok_or_else(Error::empty)?;
+            self.context.UpdateSubresource(&texture, 0, None, picture.pixels.as_ptr().cast(), picture.width * 4, 0);
+            self.context.GenerateMips(&view);
+            Ok(view)
+        }
+    }
+}
+
+/// One display's drawing surface: a swap chain shown through DirectComposition, so it composes with per-pixel alpha.
+pub struct Surface {
+    swap_chain: IDXGISwapChain1,
+    target_view: ID3D11RenderTargetView,
+    _target: IDCompositionTarget,
+    _visual: IDCompositionVisual,
+    /// How much of the snow shows, as it fades out under a full-screen app and back in.
+    effect: IDCompositionEffectGroup,
+    width: u32,
+    height: u32,
+    sprites: Option<ID3D11Buffer>,
+    sprite_capacity: usize,
+    heights: Option<(ID3D11Buffer, ID3D11ShaderResourceView)>,
+    height_capacity: usize,
+    /// The field drops on the glass add up into, as big as the swap chain; made while there are any.
+    field: Option<(ID3D11RenderTargetView, ID3D11ShaderResourceView)>,
+    /// Lights belonging to sprites drawn on a separate surface.
+    pub extra_lights: Vec<Sprite>,
+    #[cfg(test)]
+    pub(crate) test_capture: Option<Vec<u8>>,
+}
+
+impl Surface {
+    #[cfg(test)]
+    fn test_pixels(&self, gpu: &Gpu) -> Result<Vec<u8>> {
+        unsafe {
+            let source = self.target_view.GetResource()?;
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: self.width,
+                Height: self.height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                ..Default::default()
+            };
+            let mut staging = None;
+            gpu.device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+            let staging = staging.ok_or_else(Error::empty)?;
+            gpu.context.CopyResource(&staging, &source);
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            gpu.context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            let mut pixels = Vec::with_capacity((self.width * self.height * 4) as usize);
+            for y in 0..self.height as usize {
+                let row = (mapped.pData as *const u8).add(y * mapped.RowPitch as usize);
+                pixels.extend_from_slice(std::slice::from_raw_parts(row, self.width as usize * 4));
+            }
+            gpu.context.Unmap(&staging, 0);
+            Ok(pixels)
+        }
+    }
+
+    /// Snow is soft enough that one pixel per DIP is indistinguishable from the panel's full resolution,
+    /// so the swap chain is DIP-sized and composition scales it up.
+    pub fn new(gpu: &Gpu, window: HWND, width: u32, height: u32, scale: (f32, f32)) -> Result<Surface> {
+        unsafe {
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: width,
+                Height: height,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                ..Default::default()
+            };
+            let swap_chain = gpu.factory.CreateSwapChainForComposition(&gpu.device, &desc, None)?;
+            let back: ID3D11Texture2D = swap_chain.GetBuffer(0)?;
+            let mut target_view = None;
+            gpu.device.CreateRenderTargetView(&back, None, Some(&mut target_view))?;
+
+            let target = gpu.composition.CreateTargetForHwnd(window, true)?;
+            let visual = gpu.composition.CreateVisual()?;
+            visual.SetContent(&swap_chain)?;
+            visual.SetBitmapInterpolationMode(DCOMPOSITION_BITMAP_INTERPOLATION_MODE_LINEAR)?;
+            visual.SetTransform2(&Matrix3x2 { M11: scale.0, M12: 0.0, M21: 0.0, M22: scale.1, M31: 0.0, M32: 0.0 })?;
+            let effect = gpu.composition.CreateEffectGroup()?;
+            visual.SetEffect(&effect)?;
+            target.SetRoot(&visual)?;
+            gpu.composition.Commit()?;
+
+            Ok(Surface {
+                swap_chain,
+                target_view: target_view.ok_or_else(Error::empty)?,
+                _target: target,
+                _visual: visual,
+                effect,
+                width,
+                height,
+                sprites: None,
+                sprite_capacity: 0,
+                heights: None,
+                height_capacity: 0,
+                field: None,
+                extra_lights: Vec::new(),
+                #[cfg(test)]
+                test_capture: None,
+            })
+        }
+    }
+
+    pub fn set_opacity(&self, gpu: &Gpu, opacity: f32) -> Result<()> {
+        unsafe {
+            self.effect.SetOpacity2(opacity)?;
+            gpu.composition.Commit()
+        }
+    }
+
+    pub fn draw(
+        &mut self,
+        gpu: &Gpu,
+        simulation: &SnowSimulation,
+        ambient: Ambient,
+        time: f32,
+        plow: Option<&Plow>,
+        truck: Option<&Truck>,
+        sleigh: Option<&Sleigh>,
+        sculpture: &[&SculptureDraw],
+        scene: bool,
+    ) -> Result<()> {
+        let sculpture_count: usize = sculpture.iter().map(|group| group.sprites.len()).sum();
+        self.reserve(gpu, (if scene { simulation.sprite_count() } else { 0 }) + sculpture_count, simulation.column_count())?;
+        let glass = if scene && simulation.has_glass_drops() {
+            Some(self.field(gpu)?)
+        } else {
+            self.field = None;
+            None
+        };
+        let (Some(sprite_buffer), Some((height_buffer, height_view))) = (&self.sprites, &self.heights) else {
+            return Ok(());
+        };
+        let context = &gpu.context;
+        unsafe {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            context.Map(sprite_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+            let buffer = std::slice::from_raw_parts_mut(mapped.pData.cast::<Sprite>(), self.sprite_capacity);
+            let sprites = if scene { simulation.write_sprites(buffer) } else { 0 };
+            let mut next = sprites;
+            for group in sculpture {
+                buffer[next..next + group.sprites.len()].copy_from_slice(&group.sprites);
+                next += group.sprites.len();
+            }
+            context.Unmap(sprite_buffer, 0);
+
+            context.Map(height_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+            let piles = simulation.write_layers(std::slice::from_raw_parts_mut(mapped.pData.cast::<f32>(), self.height_capacity));
+            context.Unmap(height_buffer, 0);
+            let pumpkins: Vec<PumpkinPlacement> = if scene { simulation.pumpkins().iter().map(PumpkinPlacement::new).collect() } else { Vec::new() };
+
+            context.OMSetRenderTargets(Some(&[Some(self.target_view.clone())]), None);
+            context.ClearRenderTargetView(&self.target_view, &[0.0; 4]);
+            context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: self.width as f32,
+                Height: self.height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            context.RSSetState(&gpu.raster);
+            context.OMSetBlendState(&gpu.blend, None, u32::MAX);
+            context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            let constants = [Some(gpu.uniforms.clone()), Some(gpu.placement.clone()), Some(gpu.pumpkin.clone())];
+            context.VSSetConstantBuffers(0, Some(&constants));
+            context.PSSetConstantBuffers(0, Some(&constants));
+
+            let (cursor, glow) = ambient.lantern;
+            let shake = simulation.shake();
+            let mut uniforms = Uniforms {
+                view_size: [simulation.width(), simulation.height()],
+                scale: 1.0,
+                time,
+                column_width: COLUMN_WIDTH,
+                column_count: 0,
+                pile_top: 0.0,
+                occluder_count: 0,
+                origin: [0.0; 2],
+                pile_bottom: 0.0,
+                height_offset: 0,
+                light: [ambient.light[0], ambient.light[1], ambient.light[2], 1.0],
+                shadow_tint: ambient.shadow_tint,
+                rim: ambient.rim,
+                lantern: [cursor.x, cursor.y, LANTERN_REACH, glow],
+                shake: [shake.x, shake.y, 0.0, 0.0],
+                pumpkins: std::array::from_fn(|k| pumpkins.get(k).map_or([0.0; 4], |pumpkin| pumpkin.light(glow))),
+                occluders: [[0.0; 4]; 16],
+                autumn: if simulation.leafy() { 1.0 } else { 0.0 },
+                blossom: if simulation.blossom() { 1.0 } else { 0.0 },
+                wilt: if simulation.wilts() { 1.0 } else { 0.0 },
+                padding: 0.0,
+            };
+            if scene {
+                let mut slot = pumpkins.len().min(uniforms.pumpkins.len());
+                for sprite in sculpture.iter().flat_map(|group| group.sprites.iter()).chain(self.extra_lights.iter()) {
+                    if sprite.mood[0] == 18.0 && sprite.pose[1] > 0.5 && slot < uniforms.pumpkins.len() {
+                        uniforms.pumpkins[slot] = [sprite.position.x, sprite.position.y, GIFT_LANTERN_REACH, GIFT_LANTERN_BRIGHTNESS * sprite.alpha];
+                        slot += 1;
+                    }
+                }
+            }
+
+            // The pumpkins go down before the snow, so the drift they sit in covers their bottoms.
+            if !pumpkins.is_empty()
+                && let Some([shell, face]) = gpu.pumpkin_pictures()
+            {
+                gpu.write(&gpu.uniforms, &uniforms)?;
+                context.IASetInputLayout(None);
+                context.VSSetShader(&gpu.pumpkin_vertex, None);
+                context.PSSetShader(&gpu.pumpkin_fragment, None);
+                context.PSSetSamplers(1, Some(&[Some(gpu.bordered.clone())]));
+                context.PSSetShaderResources(2, Some(&[Some(shell.clone()), Some(face.clone())]));
+                for pumpkin in &pumpkins {
+                    gpu.write(&gpu.pumpkin, pumpkin)?;
+                    context.Draw(4, 0);
+                }
+            }
+            if scene && !piles.is_empty() {
+                context.IASetInputLayout(None);
+                context.VSSetShader(&gpu.pile_vertex, None);
+                context.PSSetShader(&gpu.pile_fragment, None);
+                context.PSSetShaderResources(0, Some(&[Some(height_view.clone())]));
+                for pile in &piles {
+                    uniforms.column_count = pile.count as i32;
+                    uniforms.pile_top = pile.top + 2.0;
+                    uniforms.pile_bottom = pile.bottom;
+                    uniforms.origin = [pile.origin.x, pile.origin.y];
+                    uniforms.shake[2] = pile.drift;
+                    uniforms.height_offset = pile.offset as i32;
+                    uniforms.occluder_count = pile.occluders.len().min(16) as i32;
+                    uniforms.occluders[..pile.occluders.len().min(16)].copy_from_slice(&pile.occluders[..pile.occluders.len().min(16)]);
+                    gpu.write(&gpu.uniforms, &uniforms)?;
+                    context.Draw(4, 0);
+                }
+            }
+            uniforms.occluder_count = 0;
+            let signs = simulation.signs();
+            if scene && !signs.is_empty() {
+                gpu.write(&gpu.uniforms, &uniforms)?;
+                context.IASetInputLayout(None);
+                context.VSSetShader(&gpu.sign_vertex, None);
+                context.PSSetShader(&gpu.sign_fragment, None);
+                context.PSSetSamplers(0, Some(&[Some(gpu.sampler.clone())]));
+                for sign in &signs {
+                    let Some((picture, size)) = gpu.sign(sign.caption) else { continue };
+                    let placement =
+                        Placement { anchor: [sign.anchor.x, sign.anchor.y], size, angle: sign.angle, ground: sign.ground, padding: [0.0; 2] };
+                    gpu.write(&gpu.placement, &placement)?;
+                    context.PSSetShaderResources(1, Some(&[Some(picture)]));
+                    context.Draw(4, 0);
+                }
+            }
+            if sprites > 0 {
+                gpu.write(&gpu.uniforms, &uniforms)?;
+                let stride = size_of::<Sprite>() as u32;
+                let offset = 0;
+                context.IASetInputLayout(&gpu.sprite_layout);
+                context.IASetVertexBuffers(0, 1, Some(&Some(sprite_buffer.clone())), Some(&stride), Some(&offset));
+                context.VSSetShader(&gpu.sprite_vertex, None);
+                // Drops on the glass first add up into their field.
+                if let Some((field_target, _)) = &glass {
+                    context.OMSetRenderTargets(Some(&[Some(field_target.clone())]), None);
+                    context.ClearRenderTargetView(field_target, &[0.0; 4]);
+                    context.OMSetBlendState(&gpu.adding, None, u32::MAX);
+                    context.PSSetShader(&gpu.field_fragment, None);
+                    context.DrawInstanced(4, sprites as u32, 0, 0);
+                    context.OMSetRenderTargets(Some(&[Some(self.target_view.clone())]), None);
+                    context.OMSetBlendState(&gpu.blend, None, u32::MAX);
+                }
+                context.PSSetShader(&gpu.sprite_fragment, None);
+                context.DrawInstanced(4, sprites as u32, 0, 0);
+                if let Some((_, field)) = &glass {
+                    context.IASetInputLayout(None);
+                    context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                    context.VSSetShader(&gpu.glass_vertex, None);
+                    context.PSSetShader(&gpu.glass_fragment, None);
+                    context.PSSetShaderResources(4, Some(&[Some(field.clone())]));
+                    context.Draw(3, 0);
+                    // Unbound, it can be drawn into again next frame.
+                    context.PSSetShaderResources(4, Some(&[None]));
+                }
+            }
+            if sculpture_count > 0 {
+                context.IASetInputLayout(&gpu.sprite_layout);
+                let stride = size_of::<Sprite>() as u32;
+                let offset = 0;
+                context.IASetVertexBuffers(0, 1, Some(&Some(sprite_buffer.clone())), Some(&stride), Some(&offset));
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                context.VSSetShader(&gpu.sprite_vertex, None);
+                context.PSSetShader(&gpu.sculpture_fragment, None);
+                if sculpture.iter().any(|group| {
+                    group.sprites.iter().any(|sprite| [6.0, 7.0, 9.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0].contains(&sprite.mood[0]))
+                }) {
+                    context.PSSetSamplers(2, Some(&[Some(gpu.pixel_sampler.clone())]));
+                }
+                let mut offset = sprites;
+                for group in sculpture {
+                    // A supported fox mound uses the same smoothed ground columns as the snow shader,
+                    // including on the separate interaction surface where the scene itself is not drawn.
+                    uniforms.column_count = 0;
+                    if let Some(sprite) = group.sprites.iter().find(|sprite| sprite.mood[0] == 14.0)
+                        && simulation.snow_available(0, sprite.position.x, 15.0) > 0.0
+                        && let Some(ground) = piles.first()
+                    {
+                        uniforms.column_count = ground.count as i32;
+                        uniforms.height_offset = ground.offset as i32;
+                        uniforms.origin = [ground.origin.x, ground.origin.y];
+                        context.PSSetShaderResources(0, Some(&[Some(height_view.clone())]));
+                    }
+                    if let Some(sprite) =
+                        group.sprites.iter().find(|sprite| [6.0, 7.0, 9.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0].contains(&sprite.mood[0]))
+                    {
+                        context.PSSetShaderResources(
+                            5,
+                            Some(&[if sprite.mood[0] == 20.0 {
+                                gpu.bullfinch_picture().cloned()
+                            } else if sprite.mood[0] == 18.0 {
+                                gpu.warm_lantern_picture().cloned()
+                            } else if sprite.mood[0] == 17.0 {
+                                gpu.golden_snowflake_picture().cloned()
+                            } else if sprite.mood[0] == 16.0 {
+                                gpu.boombox_picture().cloned()
+                            } else if sprite.mood[0] == 15.0 {
+                                gpu.gift_picture(sprite.pose[1] > 0.5).cloned()
+                            } else if sprite.mood[0] == 14.0 {
+                                gpu.fox_burrow_picture().cloned()
+                            } else if sprite.mood[0] == 13.0 {
+                                gpu.fox_picture().cloned()
+                            } else {
+                                gpu.conifer_picture(sprite.mood[0], sprite.pose[1] as usize, sprite.pose[2] as usize).cloned()
+                            }]),
+                        );
+                    }
+                    let count = group.covers.len().min(uniforms.occluders.len());
+                    uniforms.occluder_count = count as i32;
+                    uniforms.occluders[..count].copy_from_slice(&group.covers[..count]);
+                    gpu.write(&gpu.uniforms, &uniforms)?;
+                    context.DrawInstanced(4, group.sprites.len() as u32, 0, offset as u32);
+                    offset += group.sprites.len();
+                }
+                uniforms.occluder_count = 0;
+            }
+            if let Some(plow) = plow
+                && let Some(picture) = gpu.plow_picture()
+            {
+                gpu.write(&gpu.uniforms, &uniforms)?;
+                let placement = Placement {
+                    anchor: [plow.x, -2.0],
+                    size: [plow.sprite_width, plow.sprite_width * 887.0 / 1774.0],
+                    angle: plow.direction,
+                    ground: plow.age,
+                    padding: [0.0; 2],
+                };
+                gpu.write(&gpu.placement, &placement)?;
+                context.IASetInputLayout(None);
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                context.VSSetShader(&gpu.plow_vertex, None);
+                context.PSSetShader(&gpu.plow_fragment, None);
+                context.PSSetSamplers(0, Some(&[Some(gpu.pixel_sampler.clone())]));
+                context.PSSetShaderResources(1, Some(&[Some(picture.clone())]));
+                context.Draw(4, 0);
+            }
+            if let Some(truck) = truck.filter(|truck| truck.rare)
+                && let Some(picture) = gpu.train_picture()
+            {
+                gpu.write(&gpu.uniforms, &uniforms)?;
+                let (rear, rear_width) = truck.trailer_placement();
+                let height = truck.sprite_width * 724.0 / crate::truck::TRAIN_FRONT;
+                context.IASetInputLayout(None);
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                context.VSSetShader(&gpu.truck_vertex, None);
+                context.PSSetShader(&gpu.train_fragment, None);
+                context.PSSetSamplers(0, Some(&[Some(gpu.pixel_sampler.clone())]));
+                context.PSSetShaderResources(1, Some(&[Some(picture.clone())]));
+                for (anchor, width, tilt, section) in
+                    [(rear, rear_width, truck.trailer_tilt, 1.0), ([truck.x, truck.height - height * 0.20], truck.sprite_width, truck.tilt, 0.0)]
+                {
+                    let placement = Placement { anchor, size: [width, height], angle: truck.direction, ground: truck.age, padding: [tilt, section] };
+                    gpu.write(&gpu.placement, &placement)?;
+                    context.Draw(4, 0);
+                }
+            }
+            if let Some(truck) = truck.filter(|truck| !truck.rare)
+                && let Some(picture) = gpu.truck_picture()
+            {
+                gpu.write(&gpu.uniforms, &uniforms)?;
+                let placement = Placement {
+                    anchor: [truck.x, truck.height - 2.0],
+                    size: [truck.sprite_width, truck.sprite_width * 724.0 / 2172.0],
+                    angle: truck.direction,
+                    ground: truck.age,
+                    padding: [truck.tilt, 0.0],
+                };
+                gpu.write(&gpu.placement, &placement)?;
+                context.IASetInputLayout(None);
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                context.VSSetShader(&gpu.truck_vertex, None);
+                context.PSSetShader(&gpu.truck_fragment, None);
+                context.PSSetSamplers(0, Some(&[Some(gpu.pixel_sampler.clone())]));
+                context.PSSetShaderResources(1, Some(&[Some(picture.clone())]));
+                context.Draw(4, 0);
+            }
+            if let Some(sleigh) = sleigh
+                && let Some(picture) = gpu.sleigh_picture()
+            {
+                gpu.write(&gpu.uniforms, &uniforms)?;
+                let placement = Placement {
+                    anchor: [sleigh.x, sleigh.y],
+                    size: [sleigh.sprite_width, sleigh.sprite_width * 724.0 / 2172.0],
+                    angle: sleigh.direction,
+                    ground: sleigh.age,
+                    padding: [0.0; 2],
+                };
+                gpu.write(&gpu.placement, &placement)?;
+                context.IASetInputLayout(None);
+                context.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+                context.VSSetShader(&gpu.sleigh_vertex, None);
+                context.PSSetShader(&gpu.sleigh_fragment, None);
+                context.PSSetSamplers(0, Some(&[Some(gpu.pixel_sampler.clone())]));
+                context.PSSetShaderResources(1, Some(&[Some(picture.clone())]));
+                context.Draw(4, 0);
+            }
+            #[cfg(test)]
+            if self.test_capture.is_some() {
+                self.test_capture = Some(self.test_pixels(gpu)?);
+            }
+            self.swap_chain.Present(1, DXGI_PRESENT(0)).ok()
+        }
+    }
+
+    /// The field drops on the glass add up into, made the first time it is needed.
+    fn field(&mut self, gpu: &Gpu) -> Result<(ID3D11RenderTargetView, ID3D11ShaderResourceView)> {
+        if let Some(field) = &self.field {
+            return Ok(field.clone());
+        }
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: self.width,
+            Height: self.height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_R16G16_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let mut texture = None;
+        let mut target = None;
+        let mut view = None;
+        unsafe {
+            gpu.device.CreateTexture2D(&desc, None, Some(&mut texture))?;
+            let texture = texture.ok_or_else(Error::empty)?;
+            gpu.device.CreateRenderTargetView(&texture, None, Some(&mut target))?;
+            gpu.device.CreateShaderResourceView(&texture, None, Some(&mut view))?;
+        }
+        let field = (target.ok_or_else(Error::empty)?, view.ok_or_else(Error::empty)?);
+        self.field = Some(field.clone());
+        Ok(field)
+    }
+
+    fn reserve(&mut self, gpu: &Gpu, sprites: usize, columns: usize) -> Result<()> {
+        if sprites > self.sprite_capacity || self.sprites.is_none() {
+            self.sprite_capacity = 1024.max(sprites * 3 / 2);
+            self.sprites = Some(dynamic_buffer(&gpu.device, self.sprite_capacity * size_of::<Sprite>(), D3D11_BIND_VERTEX_BUFFER)?);
+        }
+        if columns > self.height_capacity || self.heights.is_none() {
+            self.height_capacity = 256.max(columns);
+            let buffer = dynamic_buffer(&gpu.device, self.height_capacity * size_of::<f32>(), D3D11_BIND_SHADER_RESOURCE)?;
+            let desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_FLOAT,
+                ViewDimension: D3D_SRV_DIMENSION_BUFFER,
+                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D11_BUFFER_SRV {
+                        Anonymous1: D3D11_BUFFER_SRV_0 { FirstElement: 0 },
+                        Anonymous2: D3D11_BUFFER_SRV_1 { NumElements: self.height_capacity as u32 },
+                    },
+                },
+            };
+            let mut view = None;
+            unsafe { gpu.device.CreateShaderResourceView(&buffer, Some(&desc), Some(&mut view))? };
+            self.heights = Some((buffer, view.ok_or_else(Error::empty)?));
+        }
+        Ok(())
+    }
+}
+
+fn compile(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
+    let mut code = None;
+    let mut errors = None;
+    let result = unsafe {
+        D3DCompile(
+            SHADERS.as_ptr().cast(),
+            SHADERS.len(),
+            s!("shaders.hlsl"),
+            None,
+            None,
+            entry,
+            target,
+            D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(error) = result {
+        let message = errors.as_ref().map(|blob| String::from_utf8_lossy(blob_bytes(blob)).into_owned()).unwrap_or_default();
+        return Err(Error::new(error.code(), message));
+    }
+    code.ok_or_else(Error::empty)
+}
+
+fn blob_bytes(blob: &ID3DBlob) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()) }
+}
+
+#[cfg(test)]
+#[test]
+fn sculpture_shader_compiles() {
+    compile(s!("sculptureFragment"), s!("ps_4_0")).expect("compile sculpture shader");
+}
+
+fn vertex_shader(device: &ID3D11Device, code: &ID3DBlob) -> Result<ID3D11VertexShader> {
+    let mut shader = None;
+    unsafe { device.CreateVertexShader(blob_bytes(code), None, Some(&mut shader))? };
+    shader.ok_or_else(Error::empty)
+}
+
+fn pixel_shader(device: &ID3D11Device, code: &ID3DBlob) -> Result<ID3D11PixelShader> {
+    let mut shader = None;
+    unsafe { device.CreatePixelShader(blob_bytes(code), None, Some(&mut shader))? };
+    shader.ok_or_else(Error::empty)
+}
+
+fn dynamic_buffer(device: &ID3D11Device, length: usize, bind: D3D11_BIND_FLAG) -> Result<ID3D11Buffer> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: length as u32,
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: bind.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        MiscFlags: 0,
+        StructureByteStride: 0,
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer))? };
+    buffer.ok_or_else(Error::empty)
+}
+
+#[cfg(test)]
+mod plow_shader_tests {
+    use super::*;
+
+    #[test]
+    fn plow_shaders_compile() {
+        compile(s!("spriteVertex"), s!("vs_4_0")).expect("sprite vertex shader");
+        compile(s!("spriteFragment"), s!("ps_4_0")).expect("sprite fragment shader");
+        compile(s!("pileVertex"), s!("vs_4_0")).expect("pile vertex shader");
+        compile(s!("pileFragment"), s!("ps_4_0")).expect("pile fragment shader");
+        compile(s!("plowVertex"), s!("vs_4_0")).expect("plow vertex shader");
+        compile(s!("plowFragment"), s!("ps_4_0")).expect("plow pixel shader");
+        compile(s!("truckVertex"), s!("vs_4_0")).expect("truck vertex shader");
+        compile(s!("truckFragment"), s!("ps_4_0")).expect("truck pixel shader");
+        compile(s!("trainFragment"), s!("ps_4_0")).expect("road train pixel shader");
+        compile(s!("sleighVertex"), s!("vs_4_0")).expect("sleigh vertex shader");
+        compile(s!("sleighFragment"), s!("ps_4_0")).expect("sleigh pixel shader");
+    }
+
+    #[test]
+    #[ignore = "requires a Direct3D graphics adapter"]
+    fn plow_texture_loads_on_gpu() {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().expect("COM");
+        }
+        let gpu = Gpu::new().expect("Direct3D device");
+        assert!(gpu.plow_picture().is_some(), "snowplow texture");
+        assert!(gpu.truck_picture().is_some(), "truck texture");
+        assert!(gpu.train_picture().is_some(), "road train texture");
+        assert!(gpu.sleigh_picture().is_some(), "sleigh texture");
+    }
+
+    #[test]
+    #[ignore = "requires a Direct3D graphics adapter"]
+    fn both_gift_textures_load_on_gpu() {
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().expect("COM");
+        }
+        let gpu = Gpu::new().expect("Direct3D device");
+        assert!(gpu.gift_picture(false).is_some(), "red gift texture");
+        assert!(gpu.gift_picture(true).is_some(), "green gift texture");
+    }
+}
