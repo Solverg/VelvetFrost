@@ -291,7 +291,12 @@ fn run_loop(commands: &Receiver<Command>, links: &Links, mut settings: Settings)
                 }
                 Command::ShowInScreenshots(on) => {
                     settings.show_in_screenshots = on;
-                    screens.iter_mut().for_each(|screen| screen.show_in_screenshots(on));
+                    let now = Clock::now();
+                    for screen in &mut screens {
+                        if let Err(error) = screen.show_in_screenshots(&gpu, on, now) {
+                            log!("could not change screenshot visibility on {}: {error}", screen.monitor.name);
+                        }
+                    }
                 }
                 Command::Scatter(pieces) => {
                     let Some(first) = pieces.first() else { continue };

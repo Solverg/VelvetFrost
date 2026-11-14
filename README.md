@@ -19,7 +19,7 @@ VelvetFrost is a Windows-focused fork of [Snowhush](https://github.com/mbezruchk
 - Watch for a visiting arctic fox or bullfinch, or enable the snowplow, Christmas truck and Santa's sleigh in Settings.
 - Adjust intensity, opacity, window interaction and individual monitors from the tray menu.
 
-Trees, gifts and visitors appear as events, so they do not all arrive immediately. Some settings and interactions are available only when their conditions are met. Trees behind desktop icons can appear in screenshots even when other effects are hidden.
+Trees, gifts and visitors appear as events, so they do not all arrive immediately. Some settings and interactions are available only when their conditions are met. When effects are hidden from screenshots, objects normally behind desktop icons are displayed in front of them instead; they remain behind ordinary windows.
 
 ## Installation and updates
 

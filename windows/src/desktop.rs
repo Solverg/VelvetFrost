@@ -11,6 +11,8 @@ use crate::tracker::{class_name, process_name};
 #[derive(Clone, Copy, Debug)]
 pub struct DesktopLayer {
     pub parent: HWND,
+    /// Top-level Explorer window containing the desktop icons.
+    pub icon_host: HWND,
     /// The icons' window, which the overlay goes just behind when it shares a parent with it.
     pub icons: Option<HWND>,
 }
@@ -27,7 +29,7 @@ pub fn find() -> Option<DesktopLayer> {
         if let Ok(icons) = FindWindowExW(Some(progman), None, w!("SHELLDLL_DefView"), None)
             && FindWindowExW(Some(progman), None, w!("WorkerW"), None).is_ok()
         {
-            return Some(DesktopLayer { parent: progman, icons: Some(icons) });
+            return Some(DesktopLayer { parent: progman, icon_host: progman, icons: Some(icons) });
         }
         // Earlier, the wallpaper is the top-level WorkerW right behind the one holding the icons.
         unsafe extern "system" fn behind_icons(window: HWND, found: LPARAM) -> BOOL {
@@ -35,13 +37,13 @@ pub fn find() -> Option<DesktopLayer> {
                 if FindWindowExW(Some(window), None, w!("SHELLDLL_DefView"), None).is_err() {
                     return true.into();
                 }
-                *(found.0 as *mut Option<HWND>) = FindWindowExW(None, Some(window), w!("WorkerW"), None).ok();
+                *(found.0 as *mut Option<(HWND, HWND)>) = FindWindowExW(None, Some(window), w!("WorkerW"), None).ok().map(|parent| (parent, window));
             }
             false.into()
         }
-        let mut found: Option<HWND> = None;
+        let mut found: Option<(HWND, HWND)> = None;
         let _ = EnumWindows(Some(behind_icons), LPARAM(&raw mut found as isize));
-        found.map(|parent| DesktopLayer { parent, icons: None })
+        found.map(|(parent, icon_host)| DesktopLayer { parent, icon_host, icons: None })
     }
 }
 

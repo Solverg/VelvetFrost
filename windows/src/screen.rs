@@ -508,7 +508,8 @@ impl Screen {
         layer: Option<DesktopLayer>,
     ) -> Result<(Overlay, Surface)> {
         let overlay = Overlay(match layer {
-            Some(layer) => create_behind(&monitor.rect, &layer)?,
+            Some(layer) if shown_in_screenshots => create_behind(&monitor.rect, &layer)?,
+            Some(layer) => create_capture_excluded_desktop_overlay(&monitor.rect, &layer)?,
             None => create_overlay(&monitor.rect, shown_in_screenshots)?,
         });
         let (physical_width, physical_height) = physical_size(monitor);
@@ -2251,18 +2252,63 @@ impl Screen {
         }
     }
 
-    pub fn show_in_screenshots(&mut self, shown: bool) {
-        self.shown_in_screenshots = shown;
-        set_capture(self.overlay.0, shown);
-        if let Some((overlay, _, _)) = &self.tree_overlay {
-            set_capture(overlay.0, shown);
+    pub fn show_in_screenshots(&mut self, gpu: &Gpu, shown: bool, now: i64) -> Result<()> {
+        if self.shown_in_screenshots == shown {
+            return Ok(());
+        }
+        // Desktop children cannot be excluded from capture. Recreate only their surfaces,
+        // preserving the simulation, trees, gifts and all other per-screen state.
+        let main = self.layer.map(|layer| Self::overlay(gpu, &self.monitor, self.size, shown, Some(layer))).transpose()?;
+        let tree = self
+            .tree_overlay
+            .as_ref()
+            .and_then(|(_, _, layer)| *layer)
+            .map(|layer| Self::overlay(gpu, &self.monitor, self.size, shown, Some(layer)))
+            .transpose()?;
+        if let Some((_, surface)) = &main {
+            surface.set_opacity(gpu, self.opacity)?;
+        }
+        if let Some((_, surface)) = &tree {
+            surface.set_opacity(gpu, self.opacity)?;
+        }
+        let mut unchanged_windows = Vec::new();
+        if main.is_none() {
+            unchanged_windows.push(self.overlay.0);
+        }
+        if tree.is_none()
+            && let Some((overlay, _, _)) = &self.tree_overlay
+        {
+            unchanged_windows.push(overlay.0);
         }
         if let Some(window) = &self.cone_input {
-            set_capture(window.0, shown);
+            unchanged_windows.push(window.0);
         }
         if let Some((overlay, _)) = &self.control {
-            set_capture(overlay.0, shown);
+            unchanged_windows.push(overlay.0);
         }
+        for (index, &window) in unchanged_windows.iter().enumerate() {
+            if let Err(error) = set_capture(window, shown) {
+                for &previous in &unchanged_windows[..index] {
+                    let _ = set_capture(previous, self.shown_in_screenshots);
+                }
+                return Err(error);
+            }
+        }
+        if let Some((overlay, surface)) = main {
+            self.overlay = overlay;
+            self.surface = surface;
+        }
+        if let Some((overlay, surface)) = tree {
+            if let Some((old_overlay, old_surface, _)) = &mut self.tree_overlay {
+                *old_overlay = overlay;
+                *old_surface = surface;
+            }
+        }
+        self.shown_in_screenshots = shown;
+        self.tree_dirty = true;
+        self.synced = false;
+        self.wake(now);
+        Ok(())
     }
 
     /// Topmost windows opened later stack above; this puts the snow back on top of them, though still under open menus,
@@ -2272,10 +2318,14 @@ impl Screen {
     /// Behind the taskbar, it is kept just under the display's taskbar, whose icons stay in front of the drift.
     pub fn raise(&self) {
         if let Some((overlay, _, layer)) = &self.tree_overlay {
-            let above = layer.map_or_else(|| lowest_open_popup().unwrap_or(HWND_TOPMOST), |layer| layer.icons.unwrap_or(HWND_TOP));
-            if layer.is_none_or(|layer| behind_needs_raise(overlay.0, layer.icons)) {
-                unsafe {
-                    let _ = SetWindowPos(overlay.0, Some(above), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            if let Some(layer) = layer.filter(|_| !self.shown_in_screenshots) {
+                raise_above_desktop(overlay.0, layer.icon_host);
+            } else {
+                let above = layer.map_or_else(|| lowest_open_popup().unwrap_or(HWND_TOPMOST), |layer| layer.icons.unwrap_or(HWND_TOP));
+                if layer.is_none_or(|layer| behind_needs_raise(overlay.0, layer.icons)) {
+                    unsafe {
+                        let _ = SetWindowPos(overlay.0, Some(above), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                    }
                 }
             }
         }
@@ -2288,6 +2338,11 @@ impl Screen {
         // A taskbar out of the topmost band, as under a full-screen app, would take the snow down with it.
         let topmost = |window: &HWND| unsafe { GetWindowLongPtrW(*window, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0 != 0;
         let taskbar = if self.behind_taskbar { taskbar(&self.monitor.bounds).filter(topmost) } else { None };
+        if let Some(layer) = self.layer.filter(|_| !self.shown_in_screenshots) {
+            raise_above_desktop(self.overlay.0, layer.icon_host);
+            self.raise_cone_input();
+            return;
+        }
         let above = match (self.layer, taskbar) {
             (Some(layer), _) => layer.icons.unwrap_or(HWND_TOP),
             (None, Some(taskbar)) => taskbar,
@@ -2614,6 +2669,292 @@ mod collection_drop_tests {
     }
 }
 
+#[cfg(test)]
+mod screenshot_layer_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop and Explorer"]
+    fn protected_overlay_uses_actual_explorer_icon_host() {
+        let layer = crate::desktop::find().expect("desktop icon layer must be available");
+        let rect = RECT { left: -32000, top: -32000, right: -31968, bottom: -31968 };
+        let overlay = Overlay(create_capture_excluded_desktop_overlay(&rect, &layer).unwrap());
+        assert!(unsafe { IsWindow(Some(layer.icon_host)).as_bool() });
+        let mut cursor = overlay.0;
+        loop {
+            cursor = unsafe { GetWindow(cursor, GW_HWNDNEXT) }.expect("desktop host must be below protected overlay");
+            if cursor == layer.icon_host {
+                break;
+            }
+            assert_eq!(class_name(cursor), "SnowhushOverlay", "ordinary window unexpectedly below protected desktop overlay");
+        }
+        let mut affinity = 0;
+        unsafe { GetWindowDisplayAffinity(overlay.0, &mut affinity).unwrap() };
+        assert_eq!(affinity, WDA_EXCLUDEFROMCAPTURE.0);
+    }
+
+    #[test]
+    #[ignore = "requires an interactive desktop, Direct3D and an isolated registry subtree"]
+    fn toggling_desktop_capture_preserves_live_objects() {
+        use windows::Win32::Foundation::ERROR_SUCCESS;
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        use windows::Win32::System::Registry::{
+            HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_OPTION_NON_VOLATILE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW,
+            RegOverridePredefKey,
+        };
+
+        const CHILD: &str = "VELVETFROST_SCREENSHOT_TEST_ROOT";
+        if let Ok(path) = std::env::var(CHILD) {
+            let path: Vec<u16> = path.encode_utf16().chain([0]).collect();
+            let mut root = HKEY::default();
+            unsafe {
+                assert_eq!(RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr()), None, KEY_ALL_ACCESS, &mut root), ERROR_SUCCESS);
+                assert_eq!(RegOverridePredefKey(HKEY_CURRENT_USER, Some(root)), ERROR_SUCCESS);
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            let rect = RECT { left: -32000, top: -32000, right: -31872, bottom: -31872 };
+            let host = Overlay(unsafe {
+                CreateWindowExW(
+                    WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!("VelvetFrost test"),
+                    WS_POPUP | WS_VISIBLE,
+                    rect.left,
+                    rect.top,
+                    128,
+                    128,
+                    None,
+                    None,
+                    Some(GetModuleHandleW(None).unwrap().into()),
+                    None,
+                )
+                .unwrap()
+            });
+            let layer = DesktopLayer { parent: host.0, icon_host: host.0, icons: None };
+            let monitor = Monitor { name: "screenshot-test".into(), rect, bounds: rect, dpi: 96, refresh: 60 };
+            let settings = Settings {
+                intensity: 50,
+                accumulate: true,
+                melt: true,
+                snow_on_windows: true,
+                behind_windows: true,
+                trees_on_top: false,
+                trees_before_snowmen: false,
+                over_full_screen: false,
+                behind_taskbar: false,
+                show_in_screenshots: false,
+                deep_interaction: false,
+                welcomed: true,
+                installed_at: 0,
+                halloween: snowhush_core::halloween::Choice { on: false, skipped: 0 },
+                mode: Mode::Snow,
+                mixed: false,
+                mix: [Mode::Snow, Mode::Rain],
+                max_performance: false,
+                opacity: 100,
+                plow_interval: 0,
+                truck_enabled: false,
+                sleigh_enabled: false,
+            };
+            let gpu = Gpu::new().unwrap();
+            let mut screen = match Screen::new(&gpu, monitor, SnowSimulation::new(128.0, 128.0, 0.0), &settings, Some(layer)) {
+                Ok(screen) => screen,
+                Err((error, _)) => panic!("create test screen: {error}"),
+            };
+            assert!(screen.trees.objects.restore_with_appearance(V2::new(64.0, 0.0), vec![20.0; 3], Some((0, 64.0)), 123));
+            screen.gifts.push(crate::gifts::Gift::with_kind(crate::gifts::GiftKind::Lantern, crate::gifts::GiftColor::Red, 64.0, 0.0, 16.0, 0, 0.0));
+            let first = screen.overlay.0;
+            screen.show_in_screenshots(&gpu, true, 1).unwrap();
+            assert_ne!(screen.overlay.0, first);
+            assert_ne!(unsafe { GetWindowLongPtrW(screen.overlay.0, GWL_STYLE) } as u32 & WS_CHILD.0, 0);
+            let child = screen.overlay.0;
+            screen.show_in_screenshots(&gpu, false, 2).unwrap();
+            assert_ne!(screen.overlay.0, child);
+            assert_eq!(unsafe { GetWindowLongPtrW(screen.overlay.0, GWL_STYLE) } as u32 & WS_CHILD.0, 0);
+            let mut affinity = 0;
+            unsafe { GetWindowDisplayAffinity(screen.overlay.0, &mut affinity).unwrap() };
+            assert_eq!(affinity, WDA_EXCLUDEFROMCAPTURE.0);
+            assert_eq!(screen.trees.objects.stacks()[0].appearance, 123);
+            assert_eq!(screen.gifts.len(), 1);
+            drop(screen);
+            return;
+        }
+        let name = format!("Software\\VelvetFrostScreenshotTest-{}", std::process::id());
+        let path: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        let mut key = HKEY::default();
+        unsafe {
+            assert_eq!(
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(path.as_ptr()),
+                    None,
+                    PCWSTR::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_ALL_ACCESS,
+                    None,
+                    &mut key,
+                    None
+                ),
+                ERROR_SUCCESS
+            );
+            let _ = RegCloseKey(key);
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["screen::screenshot_layer_tests::toggling_desktop_capture_preserves_live_objects", "--exact", "--ignored", "--nocapture"])
+            .env(CHILD, &name)
+            .output()
+            .unwrap();
+        unsafe {
+            assert_eq!(RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr())), ERROR_SUCCESS);
+        }
+        assert!(
+            output.status.success(),
+            "isolated capture test failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an interactive Windows desktop and DWM"]
+    fn protected_desktop_overlay_is_top_level_excluded_and_above_icons() {
+        register_class().unwrap();
+        let rect = RECT { left: -32000, top: -32000, right: -31968, bottom: -31968 };
+        let host = Overlay(unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                CLASS,
+                w!("VelvetFrost test desktop"),
+                WS_POPUP,
+                rect.left,
+                rect.top,
+                32,
+                32,
+                None,
+                None,
+                Some(GetModuleHandleW(None).unwrap().into()),
+                None,
+            )
+            .unwrap()
+        });
+        unsafe {
+            let _ = ShowWindow(host.0, SW_SHOWNOACTIVATE);
+        }
+        let ordinary = Overlay(unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("Ordinary test window"),
+                WS_POPUP | WS_VISIBLE,
+                rect.left,
+                rect.top,
+                32,
+                32,
+                None,
+                None,
+                Some(GetModuleHandleW(None).unwrap().into()),
+                None,
+            )
+            .unwrap()
+        });
+        let layer = DesktopLayer { parent: host.0, icon_host: host.0, icons: None };
+        let protected = Overlay(create_capture_excluded_desktop_overlay(&rect, &layer).unwrap());
+        let style = unsafe { GetWindowLongPtrW(protected.0, GWL_STYLE) } as u32;
+        let ex_style = unsafe { GetWindowLongPtrW(protected.0, GWL_EXSTYLE) } as u32;
+        assert_eq!(style & WS_CHILD.0, 0, "capture-excluded overlay must be a top-level window");
+        assert_eq!(ex_style & WS_EX_TOPMOST.0, 0, "desktop overlay must stay behind ordinary windows");
+        assert_ne!(ex_style & WS_EX_TRANSPARENT.0, 0, "desktop icons must remain clickable");
+        let mut affinity = 0;
+        unsafe { GetWindowDisplayAffinity(protected.0, &mut affinity).unwrap() };
+        assert_eq!(affinity, WDA_EXCLUDEFROMCAPTURE.0);
+        assert_eq!(unsafe { GetWindow(protected.0, GW_HWNDNEXT).unwrap() }, host.0);
+        assert_eq!(unsafe { GetWindow(protected.0, GW_HWNDPREV).unwrap() }, ordinary.0);
+        set_capture(protected.0, true).unwrap();
+        unsafe { GetWindowDisplayAffinity(protected.0, &mut affinity).unwrap() };
+        assert_eq!(affinity, WDA_NONE.0);
+        set_capture(protected.0, false).unwrap();
+        unsafe { GetWindowDisplayAffinity(protected.0, &mut affinity).unwrap() };
+        assert_eq!(affinity, WDA_EXCLUDEFROMCAPTURE.0);
+
+        let normal = Overlay(create_behind(&rect, &layer).unwrap());
+        assert_ne!(unsafe { GetWindowLongPtrW(normal.0, GWL_STYLE) } as u32 & WS_CHILD.0, 0);
+    }
+
+    #[test]
+    #[ignore = "requires an unobstructed interactive Windows desktop, DWM and Direct3D"]
+    fn desktop_overlay_is_removed_from_and_restored_to_real_screen_capture() {
+        use windows::Win32::Graphics::Dwm::DwmFlush;
+        use windows::Win32::Graphics::Gdi::{
+            BitBlt, CAPTUREBLT, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetPixel, HGDIOBJ, ReleaseDC, SRCCOPY,
+            SelectObject,
+        };
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+        let left = (width / 2 - 64).max(0);
+        let rect = RECT { left, top: 40, right: left + 128, bottom: 168 };
+        let host = Overlay(unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("STATIC"),
+                w!("VelvetFrost capture test"),
+                WS_POPUP | WS_VISIBLE,
+                rect.left,
+                rect.top,
+                128,
+                128,
+                None,
+                None,
+                Some(GetModuleHandleW(None).unwrap().into()),
+                None,
+            )
+            .unwrap()
+        });
+        let layer = DesktopLayer { parent: host.0, icon_host: host.0, icons: None };
+        let overlay = Overlay(create_capture_excluded_desktop_overlay(&rect, &layer).unwrap());
+        let gpu = Gpu::new().unwrap();
+        let mut surface = Surface::new(&gpu, overlay.0, 128, 128, (1.0, 1.0)).unwrap();
+        let simulation = SnowSimulation::new(128.0, 128.0, 0.0);
+        let mut trees = snowhush_core::snowmen::Snowmen::default();
+        assert!(trees.restore_with_appearance(V2::new(64.0, 5.0), vec![20.0; 3], Some((0, 64.0)), 1));
+        let group = SculptureDraw {
+            sprites: crate::sculpt::tree_sprites(&trees.stacks()[0], crate::cone::Species::Spruce, 0, 0.0),
+            covers: Vec::new(),
+            control: false,
+        };
+        let ambient = Ambient { light: [1.0; 3], shadow_tint: [0.0; 4], rim: [0.0; 4], lantern: (V2::ZERO, 0.0) };
+        surface.draw(&gpu, &simulation, ambient, 0.0, None, None, None, &[&group], false).unwrap();
+
+        let capture = || unsafe {
+            DwmFlush().unwrap();
+            let source = GetDC(None);
+            let target = CreateCompatibleDC(Some(source));
+            let bitmap = CreateCompatibleBitmap(source, 128, 128);
+            let previous = SelectObject(target, HGDIOBJ(bitmap.0));
+            BitBlt(target, 0, 0, 128, 128, Some(source), rect.left, rect.top, SRCCOPY | CAPTUREBLT).unwrap();
+            let pixels: Vec<u32> = (0..128).step_by(2).flat_map(|y| (0..128).step_by(2).map(move |x| GetPixel(target, x, y).0)).collect();
+            SelectObject(target, previous);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(target);
+            let _ = ReleaseDC(None, source);
+            pixels
+        };
+        set_capture(overlay.0, true).unwrap();
+        let shown = capture();
+        set_capture(overlay.0, false).unwrap();
+        let hidden = capture();
+        set_capture(overlay.0, true).unwrap();
+        let shown_again = capture();
+        let changed = shown.iter().zip(&hidden).filter(|(a, b)| a != b).count();
+        let restored = shown_again.iter().zip(&hidden).filter(|(a, b)| a != b).count();
+        assert!(changed > 30, "visible tree must disappear from screen capture; changed pixels: {changed}");
+        assert!(restored > 30, "tree must return to screen capture when enabled; changed pixels: {restored}");
+    }
+}
+
 pub fn dip_size(monitor: &Monitor) -> (u32, u32) {
     let (width, height) = physical_size(monitor);
     let scale = monitor.dpi.max(96) as f32 / 96.0;
@@ -2843,7 +3184,7 @@ fn collect_cone_click(window: HWND, cone: &mut Option<Cone>, blocked: bool) -> b
 fn create_cone_input(rect: &RECT, shown_in_screenshots: bool) -> Result<HWND> {
     register_class()?;
     unsafe {
-        let window = CreateWindowExW(
+        let window = Overlay(CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             CLASS,
             w!("VelvetFrost"),
@@ -2856,15 +3197,14 @@ fn create_cone_input(rect: &RECT, shown_in_screenshots: bool) -> Result<HWND> {
             None,
             Some(GetModuleHandleW(None)?.into()),
             None,
-        )?;
-        if let Err(error) = SetLayeredWindowAttributes(window, COLORREF(0), 1, LWA_ALPHA) {
-            let _ = DestroyWindow(window);
-            return Err(error);
-        }
-        set_capture(window, shown_in_screenshots);
-        let _ = SetPropW(window, w!("NonRudeHWND"), Some(HANDLE(1 as *mut c_void)));
-        let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
-        Ok(window)
+        )?);
+        SetLayeredWindowAttributes(window.0, COLORREF(0), 1, LWA_ALPHA)?;
+        set_capture(window.0, shown_in_screenshots)?;
+        let _ = SetPropW(window.0, w!("NonRudeHWND"), Some(HANDLE(1 as *mut c_void)));
+        let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
+        let handle = window.0;
+        std::mem::forget(window);
+        Ok(handle)
     }
 }
 
@@ -2872,7 +3212,7 @@ fn create_overlay(rect: &RECT, shown_in_screenshots: bool) -> Result<HWND> {
     register_class()?;
     unsafe {
         let instance = GetModuleHandleW(None)?;
-        let window = CreateWindowExW(
+        let window = Overlay(CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             CLASS,
             w!("VelvetFrost"),
@@ -2885,15 +3225,68 @@ fn create_overlay(rect: &RECT, shown_in_screenshots: bool) -> Result<HWND> {
             None,
             Some(instance.into()),
             None,
-        )?;
+        )?);
         // A layered window stays invisible until it is given an opacity; WS_EX_TRANSPARENT then lets clicks through.
-        SetLayeredWindowAttributes(window, COLORREF(0), 255, LWA_ALPHA)?;
-        set_capture(window, shown_in_screenshots);
+        SetLayeredWindowAttributes(window.0, COLORREF(0), 255, LWA_ALPHA)?;
+        set_capture(window.0, shown_in_screenshots)?;
         // With the taskbar set to hide itself, the overlay fills the whole display, and the shell would take it for a
         // full-screen app: notifications go quiet, and a maximized window in front reads as full screen and covers it.
-        let _ = SetPropW(window, w!("NonRudeHWND"), Some(HANDLE(1 as *mut c_void)));
-        let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
-        Ok(window)
+        let _ = SetPropW(window.0, w!("NonRudeHWND"), Some(HANDLE(1 as *mut c_void)));
+        let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
+        let handle = window.0;
+        std::mem::forget(window);
+        Ok(handle)
+    }
+}
+
+/// A non-topmost desktop overlay can be excluded from capture, unlike a child of Explorer.
+/// It is placed just above the icons' top-level host and remains below normal windows.
+fn create_capture_excluded_desktop_overlay(rect: &RECT, layer: &DesktopLayer) -> Result<HWND> {
+    register_class()?;
+    unsafe {
+        let window = Overlay(CreateWindowExW(
+            WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            CLASS,
+            w!("VelvetFrost"),
+            WS_POPUP,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            None,
+            None,
+            Some(GetModuleHandleW(None)?.into()),
+            None,
+        )?);
+        SetLayeredWindowAttributes(window.0, COLORREF(0), 255, LWA_ALPHA)?;
+        set_capture(window.0, false)?;
+        let _ = SetPropW(window.0, w!("NonRudeHWND"), Some(HANDLE(1 as *mut c_void)));
+        let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
+        raise_above_desktop(window.0, layer.icon_host);
+        let handle = window.0;
+        std::mem::forget(window);
+        Ok(handle)
+    }
+}
+
+fn raise_above_desktop(overlay: HWND, icon_host: HWND) {
+    unsafe {
+        // Multiple monitor overlays can share this slot without continually reshuffling.
+        let mut below = overlay;
+        while let Ok(next) = GetWindow(below, GW_HWNDNEXT) {
+            if next == icon_host {
+                return;
+            }
+            if !class_name(next).encode_utf16().eq(CLASS.as_wide().iter().copied()) {
+                break;
+            }
+            below = next;
+        }
+        let above = GetWindow(icon_host, GW_HWNDPREV)
+            .ok()
+            .filter(|window| *window != overlay && GetWindowLongPtrW(*window, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 == 0)
+            .unwrap_or(HWND_NOTOPMOST);
+        let _ = SetWindowPos(overlay, Some(above), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     }
 }
 
@@ -2943,10 +3336,8 @@ fn register_class() -> Result<()> {
     Ok(())
 }
 
-fn set_capture(window: HWND, shown: bool) {
-    unsafe {
-        let _ = SetWindowDisplayAffinity(window, if shown { WDA_NONE } else { WDA_EXCLUDEFROMCAPTURE });
-    }
+fn set_capture(window: HWND, shown: bool) -> Result<()> {
+    unsafe { SetWindowDisplayAffinity(window, if shown { WDA_NONE } else { WDA_EXCLUDEFROMCAPTURE }) }
 }
 
 unsafe extern "system" fn overlay_procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
