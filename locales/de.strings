@@ -107,6 +107,25 @@
 "update.click" = "Zum Herunterladen klicken.";
 "update.latest" = "Alles aktuell.\n\nVelvetFrost {current} ist die neueste Version.";
 "update.failed" = "Die Suche nach Updates ist fehlgeschlagen.";
+"update.ready" = "VelvetFrost {version} ist zur Installation bereit";
+"update.click_install" = "Klicken, um die Installation auszuwählen.";
+"update.install_ask" = "VelvetFrost {version} wurde heruntergeladen und überprüft.\n\nJetzt installieren und neu starten?";
+"update.install_failed" = "Das Update konnte nicht installiert werden. Bitte erneut versuchen.";
+"update.restart_error" = "Das Update wurde installiert, aber VelvetFrost konnte nicht gestartet werden. Bitte über das Startmenü öffnen.";
+"update.installed_only" = "Die automatische Installation ist nur aus der installierten VelvetFrost-App verfügbar.";
+"update.downloading" = "Updates werden gesucht und heruntergeladen. Bitte warten.";
+"update.installing" = "Das Update wird installiert. Bitte warten.";
+"update.key_error" = "Der Schlüssel zur Updateprüfung ist nicht eingerichtet.";
+"update.response_error" = "Die Releaseinformationen sind ungültig.";
+"update.assets_error" = "Die signierten Updatedateien fehlen im Release.";
+"update.file_error" = "Die Updatedatei konnte nicht geladen oder geöffnet werden.";
+"update.verify_error" = "Das Update konnte nicht überprüft werden und wurde nicht installiert.";
+"update.card_title" = "Update bereit";
+"update.card_body" = "VelvetFrost {version} wurde heruntergeladen und überprüft. Jetzt installieren und neu starten?";
+"update.install_button" = "INSTALLIEREN UND NEU STARTEN";
+"update.later" = "Später";
+"update.changed" = "Das verfügbare Update hat sich geändert. Bitte vor der Installation erneut prüfen.";
+"update.menu_ready" = "Update installieren …";
 "shortcut" = "Schnee auf deinem Desktop";
 
 "setup.fresh" = "Version {version}. Wird nur für dich installiert, ohne Administratorrechte.";

@@ -25,7 +25,7 @@ Trees, gifts and visitors appear as events, so they do not all arrive immediatel
 
 VelvetFrost releases will be published separately from Snowhush at the fork's [GitHub repository](https://github.com/Solverg/VelvetFrost). See [RELEASING.md](RELEASING.md) for the local build and release checklist.
 
-The Windows installer is per-user and currently unsigned, so Windows SmartScreen may display a warning. VelvetFrost has its own installation folder, settings and startup entry. Snowhush and VelvetFrost cannot run at the same time. Update checks use the fork's GitHub Releases by default; they need a publicly accessible release repository. The installer includes an offline license and notice viewer and installs the license and third-party notices beside the application.
+The Windows installer is per-user and currently unsigned, so Windows SmartScreen may display a warning. VelvetFrost has its own installation folder, settings and startup entry. Snowhush and VelvetFrost cannot run at the same time. Update checks use the fork's GitHub Releases by default; they need a publicly accessible release repository. Newer versions can be downloaded in the background and are offered for installation after their signed version and contents have been verified. Installing an update requires your confirmation. The installer includes an offline license and notice viewer and installs the license and third-party notices beside the application.
 
 ## Building on Windows
 

@@ -107,6 +107,25 @@
 "update.click" = "Clique para baixar.";
 "update.latest" = "Tudo atualizado.\n\nO VelvetFrost {current} é a versão mais recente.";
 "update.failed" = "Não foi possível procurar atualizações.";
+"update.ready" = "O VelvetFrost {version} está pronto para instalar";
+"update.click_install" = "Clique para escolher se deseja instalar.";
+"update.install_ask" = "O VelvetFrost {version} foi transferido e verificado.\n\nInstalar e reiniciar agora?";
+"update.install_failed" = "Não foi possível instalar a atualização. Tente novamente.";
+"update.restart_error" = "A atualização foi instalada, mas não foi possível iniciar o VelvetFrost. Abra-o pelo menu Iniciar.";
+"update.installed_only" = "A instalação automática está disponível apenas a partir do VelvetFrost instalado.";
+"update.downloading" = "A procurar e transferir atualizações. Aguarde.";
+"update.installing" = "A instalar a atualização. Aguarde.";
+"update.key_error" = "A chave de verificação de atualizações não está configurada.";
+"update.response_error" = "As informações da versão são inválidas.";
+"update.assets_error" = "Faltam os ficheiros assinados da atualização nesta versão.";
+"update.file_error" = "Não foi possível transferir ou abrir o ficheiro de atualização.";
+"update.verify_error" = "Não foi possível verificar a atualização e esta não foi instalada.";
+"update.card_title" = "Atualização pronta";
+"update.card_body" = "O VelvetFrost {version} foi transferido e verificado. Instalar e reiniciar agora?";
+"update.install_button" = "INSTALAR E REINICIAR";
+"update.later" = "Mais tarde";
+"update.changed" = "A atualização disponível mudou. Verifique-a antes de instalar.";
+"update.menu_ready" = "Instalar atualização…";
 "shortcut" = "Neve na sua área de trabalho";
 
 "setup.fresh" = "Versão {version}. Instala só para você, sem permissões de administrador.";

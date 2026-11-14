@@ -36,17 +36,34 @@ pub fn installed_version() -> Option<String> {
     read_string(UNINSTALL, w!("DisplayVersion"))
 }
 
+/// The per-user application path, used to restart after an update attempt.
+pub fn installed_exe() -> Option<PathBuf> {
+    Some(known_folder(&FOLDERID_UserProgramFiles)?.join("VelvetFrost").join("VelvetFrost.exe"))
+}
+
 /// Install or update VelvetFrost in its own per-user location.
 pub fn install(app: &[u8], version: &str) -> Result<PathBuf, String> {
     let programs_folder = known_folder(&FOLDERID_UserProgramFiles).ok_or_else(|| snowhush_core::text::tr("install.folder").to_string())?;
+    install_to(app, version, &programs_folder, known_folder(&FOLDERID_Programs).as_deref(), CONTROLLER, crate::instance::Instance::acquire)
+}
+
+/// The same handoff for the normal installer and the isolated process test.
+fn install_to(
+    app: &[u8],
+    version: &str,
+    programs_folder: &Path,
+    shortcuts: Option<&Path>,
+    controller: PCWSTR,
+    acquire: impl FnOnce() -> Option<crate::instance::Instance>,
+) -> Result<PathBuf, String> {
     let folder = programs_folder.join("VelvetFrost");
     let exe = folder.join("VelvetFrost.exe");
-    if !close_running(CONTROLLER, &exe) {
+    if !close_running(controller, &exe) {
         return Err(snowhush_core::text::tr("install.busy").to_string());
     }
     // Prevent either application from starting during installation.
-    let Some(_instance) = crate::instance::Instance::acquire() else { return Err(snowhush_core::text::tr("install.busy").to_string()) };
-    finish_install(app, version, &programs_folder, known_folder(&FOLDERID_Programs).as_deref())
+    let Some(_instance) = acquire() else { return Err(snowhush_core::text::tr("install.busy").to_string()) };
+    finish_install(app, version, programs_folder, shortcuts)
 }
 
 fn finish_install(app: &[u8], version: &str, programs_folder: &Path, shortcuts: Option<&Path>) -> Result<PathBuf, String> {
@@ -176,10 +193,17 @@ fn remove_registration(delete_settings: bool) {
 }
 
 pub fn launch(exe: &Path) {
+    let _ = launch_checked(exe);
+}
+
+/// Report launch errors to update flows instead of silently losing the restart.
+pub fn launch_checked(exe: &Path) -> Result<(), String> {
     let path: Vec<u16> = exe.as_os_str().encode_wide_null();
-    unsafe {
-        ShellExecuteW(None, w!("open"), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    let result = unsafe { ShellExecuteW(None, w!("open"), PCWSTR(path.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+    if result.0 as isize <= 32 {
+        return Err(snowhush_core::text::tr("update.restart_error").to_string());
     }
+    Ok(())
 }
 
 /// Only close a window if it is the executable we intend to replace.
@@ -277,8 +301,137 @@ mod tests {
         HKEY, KEY_ALL_ACCESS, REG_OPTION_NON_VOLATILE, RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegOverridePredefKey,
     };
 
+    const TEST_OLD_PROCESS: &str = "VELVETFROST_ISOLATED_OLD_PROCESS";
+
+    /// A separate, hidden test window which owns only a unique test mutex.
+    /// It never opens the normal application settings or installation folder.
+    fn old_process_fixture() {
+        use windows::Win32::Foundation::{HWND, LRESULT};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+
+        unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+            match message {
+                WM_CLOSE => {
+                    unsafe {
+                        let _ = DestroyWindow(window);
+                    };
+                    LRESULT(0)
+                }
+                WM_DESTROY => {
+                    unsafe {
+                        PostQuitMessage(0);
+                    };
+                    LRESULT(0)
+                }
+                _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+            }
+        }
+
+        let class: Vec<u16> = std::env::var("VELVETFROST_TEST_CLASS").unwrap().encode_utf16().chain([0]).collect();
+        let mutex: Vec<u16> = std::env::var("VELVETFROST_TEST_MUTEX").unwrap().encode_utf16().chain([0]).collect();
+        let _instance = crate::instance::Instance::acquire_for_test(PCWSTR(mutex.as_ptr())).unwrap();
+        unsafe {
+            let instance = GetModuleHandleW(None).unwrap();
+            let class =
+                WNDCLASSW { lpfnWndProc: Some(procedure), hInstance: instance.into(), lpszClassName: PCWSTR(class.as_ptr()), ..Default::default() };
+            assert_ne!(RegisterClassW(&class), 0);
+            let _window = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class.lpszClassName,
+                w!("VelvetFrost isolated test"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+            .unwrap();
+            std::fs::write(std::env::var_os("VELVETFROST_TEST_READY").unwrap(), b"ready").unwrap();
+            let mut message = MSG::default();
+            while GetMessageW(&mut message, None, 0, 0).as_bool() {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        std::fs::write(std::env::var_os("VELVETFROST_TEST_CLOSED").unwrap(), b"closed").unwrap();
+    }
+
+    fn wait_for_file(path: &Path, description: &str) {
+        let started = Instant::now();
+        while !path.is_file() {
+            assert!(started.elapsed() < Duration::from_secs(20), "timed out waiting for {description}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn isolated_update_handoff(folder: &Path) {
+        let id = format!("{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let class = format!("VelvetFrostUpdateTest-{id}");
+        let mutex = format!("Local\\VelvetFrostUpdateTest-{id}");
+        let class_wide: Vec<u16> = class.encode_utf16().chain([0]).collect();
+        let mutex_wide: Vec<u16> = mutex.encode_utf16().chain([0]).collect();
+        let ready = folder.join("old-ready");
+        let closed = folder.join("old-closed");
+        let restarted = folder.join("new-started");
+        let exe = folder.join("VelvetFrost").join("VelvetFrost.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let mut old = ChildGuard(
+            std::process::Command::new(&exe)
+                .args(["install::tests::install_update_and_uninstall_preserve_unrelated_snowhush_data", "--exact", "--nocapture"])
+                .env(TEST_OLD_PROCESS, "1")
+                .env("VELVETFROST_TEST_CLASS", &class)
+                .env("VELVETFROST_TEST_MUTEX", &mutex)
+                .env("VELVETFROST_TEST_READY", &ready)
+                .env("VELVETFROST_TEST_CLOSED", &closed)
+                .spawn()
+                .unwrap(),
+        );
+        wait_for_file(&ready, "the isolated old process");
+        let class = PCWSTR(class_wide.as_ptr());
+        let mutex = PCWSTR(mutex_wide.as_ptr());
+        assert!(crate::instance::Instance::acquire_for_test(mutex).is_none());
+        assert!(!close_running(class, &folder.join("different.exe")));
+        assert!(old.0.try_wait().unwrap().is_none(), "an unrelated process must not be closed");
+
+        // This tiny test binary records a restart and never touches app settings.
+        let stub_source = folder.join("restart-stub.rs");
+        let stub_exe = folder.join("restart-stub.exe");
+        std::fs::write(&stub_source, format!("fn main() {{ std::fs::write({:?}, b\"started\").unwrap(); }}", restarted.to_string_lossy())).unwrap();
+        let compiled = std::process::Command::new("rustc").arg(&stub_source).arg("-o").arg(&stub_exe).status().unwrap();
+        assert!(compiled.success(), "could not build isolated restart fixture");
+        let payload = std::fs::read(&stub_exe).unwrap();
+        let installed = install_to(&payload, "1.0.2", folder, None, class, || crate::instance::Instance::acquire_for_test(mutex)).unwrap();
+        assert!(old.0.wait().unwrap().success());
+        assert!(closed.is_file(), "old process must close normally");
+        assert_eq!(std::fs::read(&installed).unwrap(), payload);
+        assert_eq!(installed_version().as_deref(), Some("1.0.2"));
+        assert_eq!(read_string(SETTINGS, w!("collection")).as_deref(), Some("velvetfrost data"));
+        assert!(crate::instance::Instance::acquire_for_test(mutex).is_some());
+        launch_checked(&installed).unwrap();
+        wait_for_file(&restarted, "the isolated restarted process");
+    }
+
     #[test]
     fn install_update_and_uninstall_preserve_unrelated_snowhush_data() {
+        if std::env::var_os(TEST_OLD_PROCESS).is_some() {
+            old_process_fixture();
+            return;
+        }
         const CHILD: &str = "VELVETFROST_INSTALL_TEST_ROOT";
         const FOLDER: &str = "VELVETFROST_INSTALL_TEST_FOLDER";
         const OTHER_SETTINGS: PCWSTR = w!("Software\\Snowhush");
@@ -338,6 +491,7 @@ mod tests {
             assert!(read_string(RUN, NAME).is_none());
             finish_install(b"reinstalled", "1.0.1", &folder, None).unwrap();
             assert_eq!(read_string(SETTINGS, w!("collection")).as_deref(), Some("velvetfrost data"));
+            isolated_update_handoff(&folder);
             remove_registration(true);
             assert!(read_string(SETTINGS, w!("collection")).is_none());
             assert_eq!(read_string(OTHER_SETTINGS, w!("collection")).as_deref(), Some("snowhush data"));

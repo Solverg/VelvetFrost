@@ -119,6 +119,25 @@
 "update.click" = "Click to download it.";
 "update.latest" = "You're up to date.\n\nVelvetFrost {current} is the latest version.";
 "update.failed" = "Couldn't check for updates.";
+"update.ready" = "VelvetFrost {version} is ready to install";
+"update.click_install" = "Click to choose whether to install it.";
+"update.install_ask" = "VelvetFrost {version} has been downloaded and verified.\n\nInstall it and restart now?";
+"update.install_failed" = "Couldn't install the update. Please try again.";
+"update.restart_error" = "The update was installed, but VelvetFrost couldn't start. Please open it from the Start menu.";
+"update.installed_only" = "Automatic installation is available only from the installed VelvetFrost application.";
+"update.downloading" = "Checking for and downloading updates. Please wait.";
+"update.installing" = "The update is being installed. Please wait.";
+"update.key_error" = "The update verification key is not configured.";
+"update.response_error" = "The release information is invalid.";
+"update.assets_error" = "The release is missing signed update files.";
+"update.file_error" = "Couldn't download or open the update file.";
+"update.verify_error" = "The update could not be verified and was not installed.";
+"update.card_title" = "Update ready";
+"update.card_body" = "VelvetFrost {version} is downloaded and verified. Install it and restart now?";
+"update.install_button" = "INSTALL AND RESTART";
+"update.later" = "Later";
+"update.changed" = "The available update changed. Please review it before installing.";
+"update.menu_ready" = "Install Update…";
 "shortcut" = "Snow on your desktop";
 
 /* Windows' installer card; its title and buttons are shown in capitals. */

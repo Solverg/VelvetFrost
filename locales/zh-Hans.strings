@@ -107,6 +107,25 @@
 "update.click" = "点击即可下载。";
 "update.latest" = "已是最新版本。\n\nVelvetFrost {current} 是最新版本。";
 "update.failed" = "无法检查更新。";
+"update.ready" = "VelvetFrost {version} 已准备好安装";
+"update.click_install" = "点击选择是否安装。";
+"update.install_ask" = "VelvetFrost {version} 已下载并验证。\n\n现在安装并重新启动吗？";
+"update.install_failed" = "无法安装更新。请重试。";
+"update.restart_error" = "更新已安装，但无法启动 VelvetFrost。请从开始菜单打开它。";
+"update.installed_only" = "自动安装只能从已安装的 VelvetFrost 应用中使用。";
+"update.downloading" = "正在检查并下载更新，请稍候。";
+"update.installing" = "正在安装更新，请稍候。";
+"update.key_error" = "尚未配置更新验证密钥。";
+"update.response_error" = "版本信息无效。";
+"update.assets_error" = "此版本缺少已签名的更新文件。";
+"update.file_error" = "无法下载或打开更新文件。";
+"update.verify_error" = "无法验证更新，因此未进行安装。";
+"update.card_title" = "更新已就绪";
+"update.card_body" = "VelvetFrost {version} 已下载并验证。现在安装并重新启动吗？";
+"update.install_button" = "安装并重新启动";
+"update.later" = "稍后";
+"update.changed" = "可用更新已更改，请在安装前查看。";
+"update.menu_ready" = "安装更新…";
 "shortcut" = "桌面上的雪";
 
 "setup.fresh" = "版本 {version}。仅为你安装，无需管理员权限。";

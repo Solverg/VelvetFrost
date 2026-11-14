@@ -17,6 +17,7 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    prepare_update_key();
     let version = env!("CARGO_PKG_VERSION");
     let icon_file = std::fs::read(ICON).expect("icon");
     for (binary, description) in [("VelvetFrost", "VelvetFrost"), ("VelvetFrost-Setup", "VelvetFrost Setup")] {
@@ -31,6 +32,24 @@ fn main() {
         std::fs::write(&path, res).expect("resources");
         println!("cargo:rustc-link-arg-bin={binary}={}", path.display());
     }
+}
+
+fn prepare_update_key() {
+    const KEY_FILE: &str = "update-public-key.hex";
+    println!("cargo:rerun-if-changed={KEY_FILE}");
+    println!("cargo:rerun-if-env-changed=VELVETFROST_TEST_UPDATE_PUBLIC_KEY");
+    let release = std::env::var("PROFILE").as_deref() == Ok("release");
+    let key = if !release {
+        std::env::var("VELVETFROST_TEST_UPDATE_PUBLIC_KEY").ok().or_else(|| std::fs::read_to_string(KEY_FILE).ok())
+    } else {
+        std::fs::read_to_string(KEY_FILE).ok()
+    };
+    let key = key.as_deref().unwrap_or("").trim();
+    assert!(
+        (!release && key.is_empty()) || (key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) && key.bytes().any(|b| b != b'0')),
+        "a valid 32-byte VelvetFrost update public key is required for release builds"
+    );
+    println!("cargo:rustc-env=VELVETFROST_UPDATE_PUBLIC_KEY={key}");
 }
 
 // Keep the exact upstream HTML for distribution, and create a text rendering for

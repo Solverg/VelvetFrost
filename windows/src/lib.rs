@@ -8,3 +8,5 @@ pub mod instance;
 pub mod language;
 #[cfg(windows)]
 pub mod license;
+#[cfg(windows)]
+pub mod update_security;

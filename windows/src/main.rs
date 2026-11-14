@@ -27,6 +27,7 @@ mod traffic;
 mod tree_space;
 mod truck;
 mod update;
+mod update_dialog;
 mod welcome;
 
 #[cfg(not(feature = "inventory-preview"))]

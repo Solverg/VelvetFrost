@@ -107,6 +107,25 @@
 "update.click" = "クリックしてダウンロード。";
 "update.latest" = "最新の状態です。\n\nVelvetFrost {current}が最新バージョンです。";
 "update.failed" = "アップデートを確認できませんでした。";
+"update.ready" = "VelvetFrost {version} をインストールできます";
+"update.click_install" = "クリックしてインストールを選択してください。";
+"update.install_ask" = "VelvetFrost {version} をダウンロードして検証しました。\n\n今すぐインストールして再起動しますか？";
+"update.install_failed" = "アップデートをインストールできませんでした。もう一度お試しください。";
+"update.restart_error" = "アップデートはインストールされましたが、VelvetFrost を起動できませんでした。スタートメニューから開いてください。";
+"update.installed_only" = "自動インストールは、インストール済みの VelvetFrost からのみ利用できます。";
+"update.downloading" = "アップデートを確認してダウンロードしています。お待ちください。";
+"update.installing" = "アップデートをインストールしています。お待ちください。";
+"update.key_error" = "アップデートの検証キーが設定されていません。";
+"update.response_error" = "リリース情報が無効です。";
+"update.assets_error" = "リリースに署名済みアップデートファイルがありません。";
+"update.file_error" = "アップデートファイルをダウンロードまたは開くことができませんでした。";
+"update.verify_error" = "アップデートを検証できなかったため、インストールしませんでした。";
+"update.card_title" = "アップデートの準備完了";
+"update.card_body" = "VelvetFrost {version} をダウンロードして検証しました。今すぐインストールして再起動しますか？";
+"update.install_button" = "インストールして再起動";
+"update.later" = "後で";
+"update.changed" = "利用可能なアップデートが変更されました。インストール前に確認してください。";
+"update.menu_ready" = "アップデートをインストール…";
 "shortcut" = "デスクトップに降る雪";
 
 "setup.fresh" = "バージョン{version}。管理者権限なしで、あなただけにインストールします。";

@@ -56,6 +56,28 @@ fn main() {
         }
         return;
     }
+    if std::env::args().skip(1).any(|argument| argument.eq_ignore_ascii_case("--apply-update")) {
+        match install::install(APP, VERSION) {
+            Ok(exe) => {
+                if let Err(error) = install::launch_checked(&exe) {
+                    let text = windows::core::HSTRING::from(error);
+                    unsafe {
+                        MessageBoxW(None, &text, w!("VelvetFrost"), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+                    }
+                }
+            }
+            Err(error) => {
+                let text = windows::core::HSTRING::from(format!("{}\n\n{error}", tr("update.install_failed")));
+                unsafe {
+                    MessageBoxW(None, &text, w!("VelvetFrost"), MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
+                }
+                if let Some(exe) = install::installed_exe().filter(|path| path.is_file()) {
+                    install::launch(&exe);
+                }
+            }
+        }
+        return;
+    }
     if std::env::args().skip(1).any(|argument| argument.eq_ignore_ascii_case("--silent") || argument.eq_ignore_ascii_case("/s")) {
         std::process::exit(if install::install(APP, VERSION).is_ok() { 0 } else { 1 });
     }

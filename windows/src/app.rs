@@ -83,6 +83,7 @@ const TIMER_WELCOME: usize = 1;
 const TIMER_UPDATES: usize = 2;
 const TIMER_HALLOWEEN: usize = 3;
 const WM_UPDATE: u32 = WM_APP + 2;
+const WM_UPDATE_INSTALLER_FINISHED: u32 = WM_APP + 3;
 /// The shell's message for a click on the tray notification.
 const NIN_BALLOONUSERCLICK: u32 = WM_USER + 5;
 const DAY: u32 = 24 * 60 * 60 * 1000;
@@ -187,8 +188,10 @@ struct App {
     locked: bool,
     display_off: bool,
     away: bool,
-    /// The download of the update the tray last announced.
-    update: Option<String>,
+    /// A verified installer, held open until it is offered or discarded.
+    update: Option<Release>,
+    update_busy: bool,
+    update_installing: bool,
 }
 
 thread_local! {
@@ -229,7 +232,21 @@ pub fn run() -> Result<()> {
         }
         SetTimer(Some(window), TIMER_UPDATES, 30_000, None);
         SetTimer(Some(window), TIMER_HALLOWEEN, 60_000, None);
-        APP.set(Some(App { settings, commands, wake, snow, icon, emblem, light, locked: false, display_off: false, away: false, update: None }));
+        APP.set(Some(App {
+            settings,
+            commands,
+            wake,
+            snow,
+            icon,
+            emblem,
+            light,
+            locked: false,
+            display_off: false,
+            away: false,
+            update: None,
+            update_busy: false,
+            update_installing: false,
+        }));
 
         let mut message = MSG::default();
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
@@ -248,10 +265,8 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
                 let x = (wparam.0 & 0xffff) as i16 as i32;
                 let y = ((wparam.0 >> 16) & 0xffff) as i16 as i32;
                 show_menu(window, x, y);
-            } else if event == NIN_BALLOONUSERCLICK
-                && let Some(url) = APP.with_borrow(|app| app.as_ref().and_then(|app| app.update.clone()))
-            {
-                update::open(&url);
+            } else if event == NIN_BALLOONUSERCLICK {
+                offer_update(window);
             }
             LRESULT(0)
         }
@@ -293,6 +308,14 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, wparam: WPARAM, 
         WM_UPDATE => {
             let result = unsafe { Box::from_raw(lparam.0 as *mut std::result::Result<Option<Release>, String>) };
             updated(window, *result, wparam.0 != 0);
+            LRESULT(0)
+        }
+        WM_UPDATE_INSTALLER_FINISHED => {
+            APP.with_borrow_mut(|app| {
+                if let Some(app) = app {
+                    app.update_installing = false;
+                }
+            });
             LRESULT(0)
         }
         WM_TIMER if wparam.0 == TIMER_WELCOME => {
@@ -479,7 +502,12 @@ fn entries(settings: &Settings, login: bool, sliders: bool, displays: &[Monitor]
         Entry::Separator,
         Entry::header(tr("general")),
         Entry::toggle(ID_LOGIN, tr("login"), login, true),
-        Entry::item(ID_UPDATES, tr("updates"), false, true),
+        Entry::item(
+            ID_UPDATES,
+            if APP.with_borrow(|app| app.as_ref().is_some_and(|app| app.update.is_some())) { tr("update.menu_ready") } else { tr("updates") },
+            false,
+            true,
+        ),
     ]);
     let mut entries = if sliders {
         vec![
@@ -774,6 +802,25 @@ fn switch_modes(app: &App) {
 
 /// Checks on another thread and reports back to the window with `WM_UPDATE`.
 fn check_for_updates(window: HWND, asked: bool) {
+    let has_update = APP.with_borrow(|app| app.as_ref().is_some_and(|app| app.update.is_some()));
+    if asked && has_update {
+        offer_update(window);
+        return;
+    }
+    let started = APP.with_borrow_mut(|app| {
+        let Some(app) = app else { return false };
+        if app.update_busy {
+            return false;
+        }
+        app.update_busy = true;
+        true
+    });
+    if !started {
+        if asked {
+            message(window, tr("update.downloading"), MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
     let target = window.0 as isize;
     thread::spawn(move || {
         let result = Box::new(update::check());
@@ -785,21 +832,27 @@ fn check_for_updates(window: HWND, asked: bool) {
 
 /// A check someone asked for always answers; the daily one only speaks up, once, about a new version.
 fn updated(window: HWND, result: std::result::Result<Option<Release>, String>, asked: bool) {
+    APP.with_borrow_mut(|app| {
+        if let Some(app) = app {
+            app.update_busy = false;
+        }
+    });
     let current = env!("CARGO_PKG_VERSION");
     match result {
-        Ok(Some(release)) if asked => {
-            let text = text::fill("update.ask", &[("version", &release.version), ("current", current)]);
-            if message(window, &text, MB_YESNO | MB_ICONINFORMATION) == IDYES {
-                update::open(&release.url);
-            }
-        }
         Ok(Some(release)) => {
+            let version = release.version.clone();
             let fresh = APP.with_borrow_mut(|app| {
                 let app = app.as_mut()?;
-                (app.update.as_deref() != Some(&release.url)).then(|| app.update = Some(release.url.clone()))
+                if app.update.as_ref().is_some_and(|old| old.version == version) {
+                    return None;
+                }
+                app.update = Some(release);
+                Some(())
             });
-            if fresh.is_some() {
-                notify(window, &text::fill("update.available", &[("version", &release.version)]), tr("update.click"));
+            if asked {
+                offer_update(window);
+            } else if fresh.is_some() {
+                notify(window, &text::fill("update.ready", &[("version", &version)]), tr("update.click_install"));
             }
         }
         Ok(None) if asked => {
@@ -812,6 +865,59 @@ fn updated(window: HWND, result: std::result::Result<Option<Release>, String>, a
                 message(window, &format!("{}\n\n{error}", tr("update.failed")), MB_OK | MB_ICONWARNING);
             }
         }
+    }
+}
+
+fn offer_update(window: HWND) {
+    if APP.with_borrow(|app| app.as_ref().is_some_and(|app| app.update_installing)) {
+        message(window, tr("update.installing"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    let version = APP.with_borrow(|app| app.as_ref().and_then(|app| app.update.as_ref()).map(|update| update.version.clone()));
+    let Some(version) = version else { return };
+    if let Err(error) = crate::update_dialog::show(window, &version) {
+        log!("update dialog failed: {error}");
+        let text = text::fill("update.install_ask", &[("version", &version)]);
+        if message(window, &text, MB_YESNO | MB_ICONINFORMATION) == IDYES {
+            install_ready(window, &version);
+        }
+    }
+}
+
+pub(crate) fn install_ready(window: HWND, expected_version: &str) {
+    if APP.with_borrow(|app| app.as_ref().is_some_and(|app| app.update_installing)) {
+        return;
+    }
+    let matches = APP.with_borrow(|app| app.as_ref().and_then(|app| app.update.as_ref()).is_some_and(|update| update.version == expected_version));
+    if !matches {
+        message(window, tr("update.changed"), MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    let result = APP.with_borrow_mut(|app| app.as_mut().and_then(|app| app.update.as_mut()).map(Release::install));
+    match result {
+        Some(Ok(mut child)) => {
+            APP.with_borrow_mut(|app| {
+                if let Some(app) = app {
+                    app.update_installing = true;
+                }
+            });
+            let target = window.0 as isize;
+            thread::spawn(move || {
+                let _ = child.wait();
+                unsafe {
+                    let _ = PostMessageW(Some(HWND(target as _)), WM_UPDATE_INSTALLER_FINISHED, WPARAM(0), LPARAM(0));
+                }
+            });
+        }
+        Some(Err(error)) => {
+            APP.with_borrow_mut(|app| {
+                if let Some(app) = app {
+                    app.update = None;
+                }
+            });
+            message(window, &format!("{}\n\n{error}", tr("update.install_failed")), MB_OK | MB_ICONWARNING);
+        }
+        None => {}
     }
 }
 

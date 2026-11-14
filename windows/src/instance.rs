@@ -22,6 +22,11 @@ impl Instance {
             Some(Self(handle))
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn acquire_for_test(name: PCWSTR) -> Option<Self> {
+        Self::acquire_named(name)
+    }
 }
 
 #[cfg(test)]
